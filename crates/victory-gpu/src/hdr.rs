@@ -185,7 +185,11 @@ fn pick(monitors: &[Monitor], want: &str) -> Option<usize> {
     }
     monitors
         .iter()
-        .find(|m| m.name.to_ascii_lowercase().contains(&lower) || m.device.to_ascii_lowercase().contains(&lower))
+        .find(|m| {
+            // (Dell's gaming brand is not in the monitor's EDID name: AW... models are Alienware.)
+            let brand = if m.name.to_ascii_uppercase().starts_with("AW") { " alienware" } else { "" };
+            format!("{}{brand}", m.name.to_ascii_lowercase()).contains(&lower) || m.device.to_ascii_lowercase().contains(&lower)
+        })
         .map(|m| m.index)
 }
 

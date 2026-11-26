@@ -57,13 +57,14 @@ pub const INTERFACES: &[Interface] = &[
 
 type This = *const Object;
 
-/// `XDisplayTryEnableHdrMode(preference, XDisplayHdrModeInfo*)`: 0 enabled (the info gets the display's minimum,
-/// maximum and maximum full-frame luminance in nits, as a console tells a title on an HDR TV), 2 disabled (the title
-/// then renders SDR; what the previous builds always answered).
+/// `XDisplayTryEnableHdrMode(preference, XDisplayHdrModeInfo*)`: `XDisplayHdrModeResult` is Unknown 0, Enabled 1,
+/// Disabled 2 (the same values the Five Star loader uses; the first HDR build here answered 0 for "enabled", which the
+/// title read as "unknown" and kept SDR). Enabled fills the info (three floats: minimum, maximum and maximum
+/// full-frame tone-map luminance in nits, as a console tells a title on an HDR TV); Disabled makes the title render
+/// SDR (what the older builds always answered).
 ///
 /// Enabled when `VICTORY_HDR` resolves to `on` (`auto` with Windows HDR on for the chosen screen is that): the swap
-/// chain then presents PQ/2020 (`victory_gpu::hdr`). ASSUMPTION: the result value 0 is `Enabled` (the enum's first
-/// member in the public GDK; the title's own use of it is what the log's "present plane colour space" lines show).
+/// chain then presents PQ/2020 (`victory_gpu::hdr`).
 extern "system" fn try_enable_hdr(_: This, preference: u32, info: *mut c_void) -> u32 {
     // 0 is "prefer HDR"; a title that prefers the refresh rate gets SDR.
     let answer = if preference == 0 { victory_gpu::hdr::title_answer() } else { None };
@@ -78,8 +79,8 @@ extern "system" fn try_enable_hdr(_: This, preference: u32, info: *mut c_void) -
                     at.add(2).write_unaligned(full);
                 }
             }
-            tracing::info!(preference, min, max, full, "HDR mode: enabled (answered Enabled=0 with the monitor's luminance: min / max / max full frame nits)");
-            0
+            tracing::info!(preference, min, max, full, "HDR mode: enabled (answered Enabled=1 with the monitor's luminance: min / max / max full frame nits)");
+            1
         }
         None => {
             tracing::info!(preference, "HDR mode: disabled (SDR presentation)");
@@ -200,9 +201,9 @@ mod tests {
     #[test]
     fn sdr_and_display_deferrals() {
         type Hdr = extern "system" fn(This, u32, *mut c_void) -> u32;
-        // Enabled (0) or disabled (2), by `VICTORY_HDR` and the host's screen.
+        // Enabled (1) or disabled (2), by `VICTORY_HDR` and the host's screen.
         let hdr = method::<Hdr>(&HDR_OBJECT, 0x20)(&HDR_OBJECT, 0, std::ptr::null_mut());
-        assert!(hdr == 0 || hdr == 2);
+        assert!(hdr == 1 || hdr == 2);
         type Acquire = extern "system" fn(This, *mut *mut c_void) -> HRESULT;
         type Close = extern "system" fn(This, *mut c_void);
         let mut handle = std::ptr::null_mut();
