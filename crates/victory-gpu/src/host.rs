@@ -625,6 +625,11 @@ pub(crate) fn log_removal_context() {
 /// Time spent in submissions since the last frame-rate line, in
 /// microseconds: preparing them on the CPU (title memory copies, texture
 /// detiling), then waiting for the GPU.
+/// All the time the submitting thread has stood waiting for the card, in
+/// microseconds, never reset (the ray budget follows its growth,
+/// `memory::rt_adapt`).
+pub(crate) static GPU_WAIT_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
@@ -3426,6 +3431,7 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     LATE_STATS[12].fetch_add(us, Ordering::Relaxed);
     LATE_WAITED[why.min(10)].fetch_add(us, Ordering::Relaxed);
     SUBMISSION_US[1].fetch_add(us, Ordering::Relaxed);
+    GPU_WAIT_TOTAL.fetch_add(us, Ordering::Relaxed);
     #[cfg(feature = "diagnostics")]
     blamed(why, us);
 }
@@ -5592,6 +5598,7 @@ impl Host {
                 LATE_STATS[12].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
                 LATE_WAITED[why.min(10)].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
                 SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
+                GPU_WAIT_TOTAL.fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::card_waited(gpu.as_micros() as u64, || {
                     format!("{flights} submissions sent ahead, settled together")
@@ -6073,6 +6080,7 @@ impl Host {
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
+        GPU_WAIT_TOTAL.fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         crate::copystat::card_waited(gpu.as_micros() as u64, || {
             let pipelines: std::collections::BTreeSet<String> = runs

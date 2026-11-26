@@ -174,6 +174,16 @@ impl<'a> Lower<'a> {
             inverse: [f[7], f[8], f[9]],
         };
         let c = self.cur;
+        // The budget the host gives this draw or dispatch (`VICTORY_RT_STEP_CAP`):
+        // 0 means no ray is walked, and then nothing is read or counted.
+        let limit = step_cap().map(|_| self.host_word(crate::native::RootType::Other(crate::emit::USER_RT_BUDGET), 0, 0));
+        let zero_i32 = self.s.m.i32(0);
+        let active = limit.map(|l| self.s.m.cmp(c, pred::NE, l, zero_i32));
+        if limit.is_some() && matches!(nodes, BvhNodes::Resource) {
+            // A walker over a buffer of the title's is held to the budget too: the host binds
+            // the counters to the shaders that name the directory.
+            let _ = self.s.root_srv_handle(crate::emit::SLOT_MEMORY);
+        }
         let at = match nodes {
             BvhNodes::Resource => {
                 let src = self
@@ -200,6 +210,21 @@ impl<'a> Lower<'a> {
                     *w = self.i32_of(v)?;
                 }
                 let (low, high) = self.bvh_address(words[0], words[1], pointer, pointer_high);
+                // With a budget of zero the look is at page 0 (always the same cache line) and
+                // notes no fault.
+                let (low, high, guard) = match active {
+                    Some(a) => {
+                        let (z, g) = (self.s.m.i32(0), guard);
+                        let low = self.s.m.select(c, a, low, z);
+                        let high = self.s.m.select(c, a, high, z);
+                        let g = match g {
+                            Some(g) => self.s.m.bin(c, Bin::And, g, a),
+                            None => a,
+                        };
+                        (low, high, Some(g))
+                    }
+                    None => (low, high, guard),
+                };
                 // One look for the node's copy, before the branches: a
                 // node is 64 bytes on 64, so its first half lies in one
                 // 64 KiB page whatever its kind.
@@ -218,34 +243,44 @@ impl<'a> Lower<'a> {
         let head = self.cur;
         // With the step cap: count this test, and note whether the frame's
         // budget is spent (`VICTORY_RT_STEP_CAP`).
-        let over = match (step_cap(), nodes) {
-            (Some(cap), BvhNodes::Memory { .. }) => {
+        let ok = match (step_cap(), active) {
+            (Some(_), Some(active)) => {
                 let i32t = self.s.t.i32;
                 let faults = self.s.root_uav_handle(crate::emit::SLOT_FAULTS);
                 let (add, one, iu) = (self.s.m.i32(0), self.s.m.i32(1), self.s.m.undef(i32t));
-                // This dispatch's counter: dword RT_SLOT_AT + the host's number.
+                // This program's counter: dword RT_SLOT_AT + the host's number.
                 let slot = self.host_word(crate::native::RootType::Other(crate::emit::USER_RT_SLOT), 0, 0);
                 let (at, k2) = (self.s.m.i32(crate::emit::RT_SLOT_AT), self.s.m.i32(2));
-                let first = self.s.m.bin(head, Bin::Add, slot, at);
-                let first = self.s.m.bin(head, Bin::Shl, first, k2);
-                let before = self.s.op(
-                    head,
-                    "atomicBinOp.i32",
-                    Attr::NoUnwind,
-                    i32t,
-                    78,
-                    &[faults, add, first, iu, iu, one],
-                );
-                let limit = self.s.m.i32(cap);
-                Some(self.s.m.cmp(head, pred::IUGE, before, limit))
+                let frame_at = self.s.m.i32(4 * crate::emit::RT_FRAME_AT);
+                let limit = limit.expect("a budget");
+                let frame_limit = self.host_word(crate::native::RootType::Other(crate::emit::USER_RT_FRAME_BUDGET), 0, 0);
+                // Only with a budget: a program with none counts nothing.
+                let region = self.begin_guarded(Some(active));
+                let cur = self.cur;
+                let first = self.s.m.bin(cur, Bin::Add, slot, at);
+                let first = self.s.m.bin(cur, Bin::Shl, first, k2);
+                let before = self.s.op(cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[faults, add, first, iu, iu, one]);
+                let in_frame = self.s.op(cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[faults, add, frame_at, iu, iu, one]);
+                let all = self.s.m.i32(u32::MAX);
+                let counted = self.end_guarded(region, &[(before, all), (in_frame, all)]);
+                let h = self.cur;
+                let ok_slot = self.s.m.cmp(h, pred::IULT, counted[0], limit);
+                let ok_frame = self.s.m.cmp(h, pred::IULT, counted[1], frame_limit);
+                Some(self.s.m.bin(h, Bin::And, ok_slot, ok_frame))
             }
             _ => None,
         };
+        let head = self.cur;
         let (k4, k6, k7) = (self.s.m.i32(4), self.s.m.i32(6), self.s.m.i32(7));
         let kind = self.s.m.bin(head, Bin::And, pointer, k7);
         let pair = self.s.m.bin(head, Bin::And, pointer, k6);
         let is_box = self.s.m.cmp(head, pred::EQ, pair, k4);
         let is_triangle = self.s.m.cmp(head, pred::IULT, kind, k4);
+        // Past the budget the node is not read at all: neither branch is taken.
+        let (run_box, run_triangle) = match ok {
+            Some(ok) => (self.s.m.bin(head, Bin::And, is_box, ok), self.s.m.bin(head, Bin::And, is_triangle, ok)),
+            None => (is_box, is_triangle),
+        };
         if count_on() && matches!(nodes, BvhNodes::Memory { .. }) {
             let i32t = self.s.t.i32;
             let faults = self.s.root_uav_handle(crate::emit::SLOT_FAULTS);
@@ -260,15 +295,26 @@ impl<'a> Lower<'a> {
                 let byte = self.s.m.i32(4 * (COUNT_AT + k as u32));
                 self.s.op(head, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[faults, add, byte, iu, iu, v]);
             }
+            // The same by program: tests, walk starts, triangle tests.
+            let pipe = self.host_word(crate::native::RootType::Other(crate::emit::USER_RT_PIPE), 0, 0);
+            let (at, k2) = (self.s.m.i32(crate::emit::RT_PIPE_AT), self.s.m.i32(2));
+            let by_pipe = [(0, one), (crate::emit::RT_PIPES, counts[2]), (2 * crate::emit::RT_PIPES, counts[3])];
+            for (offset, v) in by_pipe {
+                let off = self.s.m.i32(offset);
+                let index = self.s.m.bin(head, Bin::Add, pipe, off);
+                let index = self.s.m.bin(head, Bin::Add, index, at);
+                let byte = self.s.m.bin(head, Bin::Shl, index, k2);
+                self.s.op(head, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[faults, add, byte, iu, iu, v]);
+            }
         }
         let (box_block, leaf_block) = (self.s.m.new_block(), self.s.m.new_block());
         let (triangle_block, join) = (self.s.m.new_block(), self.s.m.new_block());
         self.s
             .m
-            .terminate(head, Term::CondBr(is_box, box_block, leaf_block));
+            .terminate(head, Term::CondBr(run_box, box_block, leaf_block));
         self.s
             .m
-            .terminate(leaf_block, Term::CondBr(is_triangle, triangle_block, join));
+            .terminate(leaf_block, Term::CondBr(run_triangle, triangle_block, join));
         self.cur = box_block;
         // LOCAL (from our wt5): with `VICTORY_BVH_MISS=1` every node is missed
         // without being read: a box returns no child and a triangle the
@@ -304,13 +350,13 @@ impl<'a> Lower<'a> {
                     (other[k], leaf_block),
                 ],
             );
-            let value = match over {
-                // Past the cap: a box has no child, anything else misses.
-                Some(over) => {
+            let value = match ok {
+                // Past a budget: a box has no child, anything else misses.
+                Some(ok) => {
                     let miss = self.s.m.i32(bvh::MISS[k].to_bits());
                     let none = self.s.m.i32(bvh::NONE);
                     let miss = self.s.m.select(join, is_box, none, miss);
-                    self.s.m.select(join, over, miss, phi)
+                    self.s.m.select(join, ok, phi, miss)
                 }
                 None => phi,
             };

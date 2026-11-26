@@ -219,7 +219,118 @@ pub(crate) struct Ready {
     pub(crate) base: u32,
     /// The node-test budget of this draw or dispatch (`VICTORY_RT_STEP_CAP`).
     pub(crate) slot: u32,
+    /// The program's number for `VICTORY_RT_COUNT`'s statistics.
+    pub(crate) pipe: u32,
 }
+
+/// Programs that walk structures, told apart by their hashes in order of first
+/// sight (the last number takes all later ones): each has a budget slot of its
+/// own, so one that tests far more than the others cannot starve them, and the
+/// number of draws or dispatches it has had since the last statistics line.
+static RT_PIPES: Mutex<Vec<(String, u64)>> = Mutex::new(Vec::new());
+
+/// The least a program may spend a frame once rays are let through (tests): in rt-adapt3 a floor of 1 M
+/// still cost 90-250 ms of GPU wait at ~10-20 ns a test.
+const RT_FLOOR: u32 = 100_000;
+
+/// What one program, and one frame, may spend on ray node tests
+/// (`VICTORY_RT_STEP_CAP` is the ceiling): the host adapts them to the cost of
+/// the rays ([`rt_adapt`]).  Programs named in `VICTORY_RT_BOOST` (hashes, comma
+/// separated) get eight times the budget.
+static RT_BUDGET: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(RT_FLOOR);
+static RT_FRAME_BUDGET: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(6 * RT_FLOOR);
+/// Structures made since the last frame: of the world's streaming (rehydrated), and full builds.
+static RT_STREAMED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static RT_FULL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The budgets of the draw or dispatch of program `pipe`: (tests it may make, tests the frame may make).
+pub fn rt_budget_for(pipe: u32) -> (u32, u32) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (b, f) = (RT_BUDGET.load(Relaxed), RT_FRAME_BUDGET.load(Relaxed));
+    static BOOST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let boost = BOOST.get_or_init(|| std::env::var("VICTORY_RT_BOOST").map(|v| v.split(',').map(|h| h.trim().to_owned()).filter(|h| !h.is_empty()).collect()).unwrap_or_default());
+    if !boost.is_empty() {
+        let all = RT_PIPES.lock().unwrap_or_else(|e| e.into_inner());
+        if all.get(pipe as usize).is_some_and(|p| boost.iter().any(|h| p.0.starts_with(h.as_str()))) {
+            return (b.saturating_mul(8), f);
+        }
+    }
+    (b, f)
+}
+
+/// The builder rehydrated a structure the world streamed in (`full`: made a bottom-level one from scratch, not a refit).
+pub fn rt_note_builds(n: u32, full: bool) {
+    let counter = if full { &RT_FULL } else { &RT_STREAMED };
+    counter.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Once a frame: the budget follows the COST OF THE RAYS, not the frame time:
+/// the time the submitting thread stood waiting for the card this frame
+/// (`host::GPU_WAIT_TOTAL`; the frame without rays is some 25 ms of it) against
+/// `VICTORY_RT_GPU_MS` (default 80): halved above it (floor 1 M), grown by a
+/// quarter below 60 % of it, up to the ceiling; and halved at once when the
+/// frame itself took over a second.  Zero while the world is streaming in (6 or
+/// more structures rehydrated in a frame, or 100 or more full builds; held for 8
+/// frames): refits and rebuilds of animated geometry every frame do not count.
+fn rt_adapt(ceiling: u32, frame: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    static LAST: Mutex<Option<(std::time::Instant, u64)>> = Mutex::new(None);
+    static BUSY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(8);
+    static TARGET: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    let target = *TARGET.get_or_init(|| std::env::var("VICTORY_RT_GPU_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(80.0));
+    let now = std::time::Instant::now();
+    let waited = crate::host::GPU_WAIT_TOTAL.load(Relaxed);
+    let (interval, gpu) = match LAST.lock().unwrap_or_else(|e| e.into_inner()).replace((now, waited)) {
+        Some((t, w)) => (now.duration_since(t).as_secs_f64() * 1000.0, waited.saturating_sub(w) as f64 / 1000.0),
+        None => (0.0, 0.0),
+    };
+    let (streamed, full) = (RT_STREAMED.swap(0, Relaxed), RT_FULL.swap(0, Relaxed));
+    let busy = if streamed >= 6 || full >= 100 { 8 } else { BUSY.load(Relaxed).saturating_sub(1) };
+    BUSY.store(busy, Relaxed);
+    let before = RT_BUDGET.load(Relaxed);
+    // `VICTORY_RT_FIXED=n`: no adaptation, n million tests per program a frame (0: no ray is walked;
+    // diagnostics: the cost of a frame with the structures built and the walkers answering misses).
+    static FIXED: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    let fixed = *FIXED.get_or_init(|| std::env::var("VICTORY_RT_FIXED").ok().and_then(|v| v.trim().parse::<u32>().ok()));
+    let next = if let Some(m) = fixed {
+        m.saturating_mul(1 << 20).min(ceiling)
+    } else if busy > 0 {
+        0
+    } else if before == 0 {
+        RT_FLOOR
+    } else if gpu > target * 2.0 || interval > 1000.0 {
+        (before / 4).max(RT_FLOOR)
+    } else if gpu > target {
+        (before / 2).max(RT_FLOOR)
+    } else if gpu < target * 0.6 {
+        (before + before / 4 + 10_000).min(ceiling)
+    } else {
+        before
+    };
+    RT_BUDGET.store(next, Relaxed);
+    RT_FRAME_BUDGET.store(next.saturating_mul(6).min(ceiling.saturating_mul(4)), Relaxed);
+    static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let said = SAID.fetch_add(1, Relaxed);
+    if next / 50_000 != before / 50_000 && (said < 400 || said % 20 == 0) || said % 100 == 0 {
+        tracing::info!(frame, budget_k = next / 1000, gpu_wait_ms = format_args!("{gpu:.0}"), interval_ms = format_args!("{interval:.0}"), streamed, full, busy, "rt budget");
+    }
+}
+
+/// The number of the program of hash `hash` (see [`RT_PIPES`]); counts a draw or dispatch for the statistics.
+pub(crate) fn rt_pipe(hash: &str) -> u32 {
+    let mut all = RT_PIPES.lock().unwrap_or_else(|e| e.into_inner());
+    let at = match all.iter().position(|p| p.0 == hash) {
+        Some(at) => at,
+        None if all.len() < victory_shader::emit::RT_PIPES as usize => {
+            all.push((hash.to_owned(), 0));
+            all.len() - 1
+        }
+        None => all.len() - 1,
+    };
+    all[at].1 += 1;
+    at as u32
+}
+
 
 impl Memory {
     fn new() -> Option<Memory> {
@@ -670,6 +781,45 @@ impl Memory {
                     self.faults.1.add(at + k).write_volatile(0);
                 }
             }
+            // By program, every 20 frames: tests, walk starts, triangle tests, draws or dispatches.
+            let n = victory_shader::emit::RT_PIPES as usize;
+            let pipe_at = victory_shader::emit::RT_PIPE_AT as usize;
+            static BY_PIPE: Mutex<Vec<[u64; 4]>> = Mutex::new(Vec::new());
+            static SINCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            {
+                let mut sum = BY_PIPE.lock().unwrap_or_else(|e| e.into_inner());
+                sum.resize(n, [0; 4]);
+                for p in 0..n {
+                    for k in 0..3 {
+                        // SAFETY: inside the faults' mapping; the GPU may be writing.
+                        unsafe {
+                            let at = self.faults.1.add(pipe_at + k * n + p);
+                            sum[p][k] += u64::from(at.read_volatile());
+                            at.write_volatile(0);
+                        }
+                    }
+                }
+                if SINCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 20 == 19 {
+                    let mut names = RT_PIPES.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut rows: Vec<(usize, [u64; 4])> = (0..names.len()).map(|p| (p, [sum[p][0], sum[p][1], sum[p][2], names[p].1])).collect();
+                    rows.sort_by_key(|r| std::cmp::Reverse(r.1[0]));
+                    let text: Vec<String> = rows
+                        .iter()
+                        .filter(|r| r.1[0] > 0)
+                        .take(12)
+                        .map(|(p, r)| format!("{} tests {} M starts {} M triangles {} M calls {} ({:.1}/start)", names[*p].0, r[0] / 1_000_000, r[1] / 1_000_000, r[2] / 1_000_000, r[3], r[0] as f64 / r[1].max(1) as f64))
+                        .collect();
+                    if !text.is_empty() {
+                        tracing::info!(frame = self.frame, "rt by program, 20 frames: {}", text.join(" | "));
+                    }
+                    for s in sum.iter_mut() {
+                        *s = [0; 4];
+                    }
+                    for p in names.iter_mut() {
+                        p.1 = 0;
+                    }
+                }
+            }
             if c[0] > 0 {
                 tracing::info!(
                     frame = self.frame,
@@ -685,7 +835,16 @@ impl Memory {
         // Dword 0 counts the node tests of a frame while `VICTORY_RT_STEP_CAP`
         // is set: over the cap, the tests past it answered as misses.
         if let Some(cap) = victory_shader::emit::step_cap() {
+            rt_adapt(cap, self.frame);
+            // SAFETY: inside the faults' mapping; the GPU may be writing.
+            let in_frame = unsafe { self.faults.1.add(victory_shader::emit::RT_FRAME_AT as usize).read_volatile() };
+            // SAFETY: as above.
+            unsafe { self.faults.1.add(victory_shader::emit::RT_FRAME_AT as usize).write_volatile(0) };
+            if in_frame > 0 && in_frame >= RT_FRAME_BUDGET.load(std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!(frame = self.frame, tests = in_frame, "rt step cap: the frame's node-test budget was spent");
+            }
             let (mut total, mut most, mut capped) = (0u64, 0u32, 0u32);
+            let mut names: Vec<String> = Vec::new();
             for s in 0..victory_shader::emit::RT_SLOTS as usize {
                 // SAFETY: inside the faults' mapping; the GPU may be writing.
                 let count = unsafe { self.faults.1.add(victory_shader::emit::RT_SLOT_AT as usize + s).read_volatile() };
@@ -693,18 +852,24 @@ impl Memory {
                 unsafe { self.faults.1.add(victory_shader::emit::RT_SLOT_AT as usize + s).write_volatile(0) };
                 total += u64::from(count);
                 most = most.max(count);
-                capped += u32::from(count >= cap);
+                if count >= RT_BUDGET.load(std::sync::atomic::Ordering::Relaxed) {
+                    capped += 1;
+                    let all = RT_PIPES.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(u) = all.get(s) {
+                        names.push(format!("{} tests {} M", u.0, count / 1_000_000));
+                    }
+                }
             }
             static FRAMES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let frames = FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if capped > 0 {
-                tracing::warn!(frame = self.frame, capped, most, total, cap, "rt step cap: draws or dispatches passed their node-test budget (the rest answered as misses)");
+                tracing::warn!(frame = self.frame, capped, most, total, budget = RT_BUDGET.load(std::sync::atomic::Ordering::Relaxed), programs = ?names, "rt step cap: draws or dispatches passed their node-test budget (the rest answered as misses)");
             } else if frames.is_multiple_of(200) && total > 0 {
                 tracing::info!(frame = self.frame, most, total, cap, "rt step cap: node tests in a frame (the most of one budget)");
             }
         }
         let mut pages = Vec::new();
-        for i in 1..victory_shader::emit::RT_SLOT_AT as usize {
+        for i in 1..victory_shader::emit::RT_PIPE_AT as usize {
             // SAFETY: inside the faults' mapping; the GPU may be writing,
             // a number missed now is written again next frame.
             let at = unsafe { self.faults.1.add(i) };
@@ -1113,10 +1278,8 @@ pub(crate) fn ready(
         directory: directory.gpu(directory.span().0),
         faults: m.faults.2,
         base,
-        slot: {
-            static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % victory_shader::emit::RT_SLOTS
-        },
+        pipe: 0,
+        slot: 0,
     })
 }
 

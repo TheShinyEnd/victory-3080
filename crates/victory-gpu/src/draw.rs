@@ -1355,6 +1355,15 @@ impl State {
         if kind == victory_shader::emit::USER_RT_SLOT {
             return memory.map_or(0, |m| m.slot);
         }
+        if kind == victory_shader::emit::USER_RT_BUDGET {
+            return memory.map_or(0, |m| crate::memory::rt_budget_for(m.pipe).0);
+        }
+        if kind == victory_shader::emit::USER_RT_FRAME_BUDGET {
+            return memory.map_or(0, |m| crate::memory::rt_budget_for(m.pipe).1);
+        }
+        if kind == victory_shader::emit::USER_RT_PIPE {
+            return memory.map_or(0, |m| m.pipe);
+        }
         // All of every group, unless the dispatch says otherwise.
         if kind == victory_shader::emit::USER_DISPATCH_THREADS_X {
             return 0;
@@ -1688,10 +1697,13 @@ impl State {
                 } else {
                     crate::memory::Use::Reads
                 };
-                let Some(ready) = self.memory_ready(list, &t, compute, use_) else {
+                let Some(mut ready) = self.memory_ready(list, &t, compute, use_) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;
                 };
+                // (`VICTORY_RT_COUNT`: told apart by program.)
+                ready.pipe = crate::memory::rt_pipe(&stage.shader.hash);
+                ready.slot = ready.pipe.min(victory_shader::emit::RT_SLOTS - 1);
                 Some(ready)
             } else {
                 None

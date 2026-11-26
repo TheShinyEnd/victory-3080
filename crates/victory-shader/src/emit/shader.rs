@@ -125,6 +125,19 @@ pub const USER_RT_SLOT: u32 = 0x107;
 /// Budgets of ray node tests in the faults buffer, and where they begin.
 pub const RT_SLOTS: u32 = 64;
 pub const RT_SLOT_AT: u32 = 4016;
+/// `RootType::Other` code of a user-data dword the host computes: the number
+/// (below [`RT_PIPES`]) of the program, for `VICTORY_RT_COUNT`'s statistics.
+pub const USER_RT_PIPE: u32 = 0x108;
+/// Programs told apart by the statistics, and where their three arrays
+/// (node tests, walk starts, triangle tests) of [`RT_PIPES`] dwords begin.
+pub const RT_PIPES: u32 = 96;
+pub const RT_PIPE_AT: u32 = RT_SLOT_AT - 3 * RT_PIPES;
+/// The frame's count of node tests (all draws and dispatches), the dword below the program statistics.
+pub const RT_FRAME_AT: u32 = RT_PIPE_AT - 1;
+/// `RootType::Other` codes of user-data dwords the host computes: how many node tests one draw or dispatch
+/// may make, and how many a frame (`VICTORY_RT_STEP_CAP`, adapted by the host to the frame time).
+pub const USER_RT_BUDGET: u32 = 0x109;
+pub const USER_RT_FRAME_BUDGET: u32 = 0x10a;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {

@@ -77,6 +77,8 @@ mod sampler;
 pub mod shader_cache;
 #[cfg(windows)]
 mod memory;
+/// For the structure builder (`victory-hle`): how many structures it has made, and the ray budget.
+pub use memory::{rt_budget_for, rt_note_builds};
 #[cfg(windows)]
 mod shadow;
 #[cfg(windows)]

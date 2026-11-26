@@ -642,6 +642,7 @@ unsafe fn build_blas(desc: &[u8], pb_count: u32, pb_infos: u64) {
     STATS.store_ns.fetch_add(t2.elapsed().as_nanos() as u64, Relaxed);
     if stored {
         STATS.blas.fetch_add(1, Relaxed);
+        victory_gpu::rt_note_builds(1, true);
         STATS.triangles.fetch_add(tris.len() as u64, Relaxed);
         STATS.narrow.fetch_add(u64::from(!wide), Relaxed);
         unsafe { postbuild(pb_count, pb_infos, built.len() as u64) };
@@ -924,6 +925,7 @@ unsafe fn rehydrate_one(desc: &[u8], source: u64) -> i32 {
             return 0;
         }
         STATS.rehydrated.fetch_add(1, Relaxed);
+        victory_gpu::rt_note_builds(1, false);
     } else {
         STATS.rehydrate_skipped.fetch_add(1, Relaxed);
     }
