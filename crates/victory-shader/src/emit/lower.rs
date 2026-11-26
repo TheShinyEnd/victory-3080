@@ -3182,7 +3182,8 @@ impl<'a> Lower<'a> {
         if let Some(g) = guard {
             missing = self.s.m.bin(c, Bin::And, missing, g);
         }
-        let places = k(self, MEMORY_FAULTS - 1);
+        // (The last 16 dwords count ray node tests: `intersect::count_on`.)
+        let places = k(self, super::shader::RT_SLOT_AT - 1);
         let faults = self.s.root_uav_handle(SLOT_FAULTS);
         let noting = self.begin_guarded(Some(missing));
         let c = self.cur;

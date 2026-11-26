@@ -69,6 +69,7 @@ struct Stats {
     rehydrated: AtomicU64,
     rehydrate_skipped: AtomicU64,
     rehydrate_faults: AtomicU64,
+    invalid: AtomicU64,
     copies: AtomicU64,
     skipped_geometry: AtomicU64,
     skipped_size: AtomicU64,
@@ -98,6 +99,7 @@ static STATS: Stats = Stats {
     rehydrated: AtomicU64::new(0),
     rehydrate_skipped: AtomicU64::new(0),
     rehydrate_faults: AtomicU64::new(0),
+    invalid: AtomicU64::new(0),
     copies: AtomicU64::new(0),
     skipped_geometry: AtomicU64::new(0),
     skipped_size: AtomicU64::new(0),
@@ -116,6 +118,9 @@ static STATS: Stats = Stats {
     console_total: AtomicU64::new(0),
 };
 
+/// Why rehydrations were skipped: source, not packed, memory, geometry,
+/// geometry buffers, the DLL faulted, not bottom-level, other.
+static SKIP_REASONS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 static LAST_LOG: Mutex<Option<Instant>> = Mutex::new(None);
 static NARROW_FIRST: AtomicBool = AtomicBool::new(false);
 
@@ -128,9 +133,9 @@ fn log_now() {
     *last = Some(now);
     let s = &STATS;
     tracing::info!(
-        "rt cpu: blas {} (refit {}, box16 {}, {} triangles), tlas {} ({} instances, {} dropped), rehydrated {} (skipped {}, DLL faults {}), copies {}, \
+        "rt cpu: blas {} (refit {}, box16 {}, {} triangles), tlas {} ({} instances, {} dropped), rehydrated {} (skipped {}, DLL faults {}, invalid {}), copies {}, \
          skipped: geometry {} size {} memory {}, procedural geometries ignored {}, build {:.1} ms total (read {:.1}, sizes {:.1}, gather {:.1}, tree {:.1}, store {:.1}), rehydrate {:.1} ms total, \
-         size ours/console {} / {} bytes, worst ratio {:.2}, probes {} calls {:.1} ms",
+         size ours/console {} / {} bytes, worst ratio {:.2}, rehydration skips {:?}, probes {} calls {:.1} ms",
         s.blas.load(Relaxed),
         s.refit.load(Relaxed),
         s.narrow.load(Relaxed),
@@ -141,6 +146,7 @@ fn log_now() {
         s.rehydrated.load(Relaxed),
         s.rehydrate_skipped.load(Relaxed),
         s.rehydrate_faults.load(Relaxed),
+        s.invalid.load(Relaxed),
         s.copies.load(Relaxed),
         s.skipped_geometry.load(Relaxed),
         s.skipped_size.load(Relaxed),
@@ -156,6 +162,7 @@ fn log_now() {
         s.ours_total.load(Relaxed),
         s.console_total.load(Relaxed),
         s.worst_ratio.load(Relaxed) as f64 / 1000.0,
+        SKIP_REASONS.iter().map(|r| r.load(Relaxed)).collect::<Vec<_>>(),
         VQ_CALLS.load(Relaxed),
         VQ_NS.load(Relaxed) as f64 / 1e6,
     );
@@ -194,7 +201,16 @@ fn mapped_inner(addr: u64, len: u64) -> bool {
         if ok == 0 {
             return false;
         }
-        at = (at | 0xfff) + 1;
+        // Title memory is mapped in blocks of 64 KiB (`XMemMapPages`), so one
+        // probe per block does (rt-cpu7: 9.4 M probes of 4 KiB cost 9.9 s).
+        at = (at | 0xffff) + 1;
+    }
+    // The last byte too (a range ending in a block of its own).
+    if end - 1 >= (addr | 0xffff) + 1 {
+        VQ_CALLS.fetch_add(1, Relaxed);
+        // SAFETY: as above.
+        let ok = unsafe { ReadProcessMemory(GetCurrentProcess(), (end - 1) as *const c_void, (&raw mut byte).cast(), 1, std::ptr::null_mut()) };
+        return ok != 0;
     }
     true
 }
@@ -310,7 +326,7 @@ unsafe extern "system" fn guard_handler(p: *mut windows_sys::Win32::System::Diag
         let me = GetCurrentThreadId();
         if (*(*p).ExceptionRecord).ExceptionCode == ACCESS_VIOLATION && WORKER_THREAD.load(Relaxed) == me {
             let c = &mut *(*p).ContextRecord;
-            c.Rip = worker_fault as usize as u64;
+            c.Rip = worker_fault as *const () as usize as u64;
             c.Rsp = ((c.Rsp - 0x200) & !0xf) - 8;
             return -1; // EXCEPTION_CONTINUE_EXECUTION
         }
@@ -532,6 +548,18 @@ unsafe fn store(dest: u64, structure: &[u8], allowed: Option<u64>) -> bool {
             return false;
         }
     }
+    // A structure no walker could get lost in, or an empty one.
+    let empty;
+    let structure = if bb::validate(structure) {
+        structure
+    } else {
+        STATS.invalid.fetch_add(1, Relaxed);
+        if STATS.invalid.load(Relaxed) <= 8 {
+            tracing::error!(bytes = structure.len(), "rt cpu: a structure failed validation; an empty one is published");
+        }
+        empty = bb::build_blas(&[]);
+        &empty
+    };
     // SAFETY: mapped checked.
     match unsafe { bytes_mut(dest, structure.len()) } {
         Some(d) => {
@@ -706,6 +734,9 @@ unsafe fn build_one(desc: &[u8], pb_count: u32, pb_infos: u64) {
 // ---- exports -----------------------------------------------------------------
 
 extern "system" fn construct(this: *mut c_void, _device: *mut c_void, _no_gpu_builder: u8) -> *mut c_void {
+    // `VICTORY_RT_SAH=1`: binned-SAH trees (about 5 % fewer node tests in the unit
+    // test's scene, 2-3x the build time) instead of Morton order.
+    bb::set_sah(std::env::var("VICTORY_RT_SAH").is_ok_and(|v| v == "1"));
     tracing::info!("rt cpu: XboxBvhBuilder constructed (no GPU builder; structures are built on the CPU)");
     this
 }
@@ -793,8 +824,13 @@ unsafe fn rehydrate_one(desc: &[u8], source: u64) -> i32 {
         return 0;
     }
     let Some(f) = d.rehydrate else { return 0 };
-    let skip = |_why: &str| {
+    let skip = |why: &str| {
         STATS.rehydrate_skipped.fetch_add(1, Relaxed);
+        let reason = ["source", "not packed", "memory", "geometry", "geometry buffers", "the DLL faulted", "not bottom-level"]
+            .iter()
+            .position(|r| *r == why)
+            .unwrap_or(7);
+        SKIP_REASONS[reason].fetch_add(1, Relaxed);
         0
     };
     // SAFETY: mapped checked.
@@ -824,22 +860,6 @@ unsafe fn rehydrate_one(desc: &[u8], source: u64) -> i32 {
         let Some(g) = (unsafe { bytes(at, GEOMETRY) }) else { return skip("geometry") };
         match unsafe { Geo::read(g) } {
             Err(()) => return skip("geometry buffers"),
-            // A geometry with no vertices or no indices: the DLL reads its
-            // first elements anyway (a crash at an unmapped page, run rt-cpu4).
-            Ok(Some(geo)) if geo.vertex_count == 0 || (geo.index_size > 0 && geo.index_count == 0) => {
-                static EMPTY: AtomicU64 = AtomicU64::new(0);
-                if EMPTY.fetch_add(1, Relaxed) < 6 {
-                    tracing::warn!(
-                        geometry = k,
-                        of = count,
-                        vertices = geo.vertex_count,
-                        indices = geo.index_count,
-                        address = format_args!("{:#x}/{:#x}", geo.vertices, geo.indices),
-                        "rt cpu: rehydration skipped: empty geometry"
-                    );
-                }
-                return skip("empty geometry");
-            }
             _ => {}
         }
         flat[GEOMETRY * k..GEOMETRY * (k + 1)].copy_from_slice(g);
@@ -880,12 +900,29 @@ unsafe fn rehydrate_one(desc: &[u8], source: u64) -> i32 {
     let Some(r) = (unsafe { guarded(f, d.this as *mut c_void, copy.as_ptr().cast()) }) else {
         STATS.rehydrate_faults.fetch_add(1, Relaxed);
         // The half-made structure must never be walked.
-        if let Some(d) = unsafe { bytes_mut(dest, 4) } {
-            d.fill(0);
+        // (An empty structure of its own size: root NONE, not zeros, which
+        // decode as a root pointing at the header.)
+        let empty = bb::build_blas(&[]);
+        if let Some(d) = unsafe { bytes_mut(dest, empty.len()) } {
+            d.copy_from_slice(&empty);
         }
         return skip("the DLL faulted");
     };
     if r >= 0 {
+        // What the DLL made must be a tree a walker can leave.
+        // SAFETY: probed above.
+        let made = unsafe { bytes(dest, size) };
+        if made.is_some_and(|m| !bb::validate_graph(m)) {
+            STATS.invalid.fetch_add(1, Relaxed);
+            if STATS.invalid.load(Relaxed) <= 8 {
+                tracing::error!(dest = format_args!("{dest:#x}"), size, "rt cpu: a rehydrated structure failed validation (a cycle, a pointer out of it or a node twice); an empty one is published");
+            }
+            let empty = bb::build_blas(&[]);
+            if let Some(d) = unsafe { bytes_mut(dest, empty.len()) } {
+                d.copy_from_slice(&empty);
+            }
+            return 0;
+        }
         STATS.rehydrated.fetch_add(1, Relaxed);
     } else {
         STATS.rehydrate_skipped.fetch_add(1, Relaxed);

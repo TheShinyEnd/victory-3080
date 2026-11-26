@@ -217,6 +217,8 @@ pub(crate) struct Ready {
     pub(crate) faults: u64,
     /// The view heap slot of the null view; copy `n`'s view is `n` further.
     pub(crate) base: u32,
+    /// The node-test budget of this draw or dispatch (`VICTORY_RT_STEP_CAP`).
+    pub(crate) slot: u32,
 }
 
 impl Memory {
@@ -657,23 +659,52 @@ impl Memory {
 
     /// The pages shaders found empty since the last frame.
     fn take_faults(&mut self) {
+        // `VICTORY_RT_COUNT=1`: the frame's ray node tests (all, box, walk starts, triangle).
+        if victory_shader::emit::count_on() {
+            let at = victory_shader::emit::COUNT_AT as usize;
+            let mut c = [0u32; 4];
+            for (k, v) in c.iter_mut().enumerate() {
+                // SAFETY: inside the faults' mapping; the GPU may be writing.
+                unsafe {
+                    *v = self.faults.1.add(at + k).read_volatile();
+                    self.faults.1.add(at + k).write_volatile(0);
+                }
+            }
+            if c[0] > 0 {
+                tracing::info!(
+                    frame = self.frame,
+                    tests = c[0],
+                    box_tests = c[1],
+                    walk_starts = c[2],
+                    triangle_tests = c[3],
+                    per_start = format_args!("{:.1}", f64::from(c[0]) / f64::from(c[2].max(1))),
+                    "rt count: node tests in a frame"
+                );
+            }
+        }
         // Dword 0 counts the node tests of a frame while `VICTORY_RT_STEP_CAP`
         // is set: over the cap, the tests past it answered as misses.
         if let Some(cap) = victory_shader::emit::step_cap() {
-            // SAFETY: inside the faults' mapping, as below.
-            let count = unsafe { self.faults.1.read_volatile() };
-            // SAFETY: as above.
-            unsafe { self.faults.1.write_volatile(0) };
+            let (mut total, mut most, mut capped) = (0u64, 0u32, 0u32);
+            for s in 0..victory_shader::emit::RT_SLOTS as usize {
+                // SAFETY: inside the faults' mapping; the GPU may be writing.
+                let count = unsafe { self.faults.1.add(victory_shader::emit::RT_SLOT_AT as usize + s).read_volatile() };
+                // SAFETY: as above.
+                unsafe { self.faults.1.add(victory_shader::emit::RT_SLOT_AT as usize + s).write_volatile(0) };
+                total += u64::from(count);
+                most = most.max(count);
+                capped += u32::from(count >= cap);
+            }
             static FRAMES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let frames = FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if count >= cap {
-                tracing::warn!(frame = self.frame, tests = count, cap, "rt step cap: a frame's ray node tests passed the cap (the rest answered as misses)");
-            } else if frames.is_multiple_of(200) && count > 0 {
-                tracing::info!(frame = self.frame, tests = count, cap, "rt step cap: node tests in a frame");
+            if capped > 0 {
+                tracing::warn!(frame = self.frame, capped, most, total, cap, "rt step cap: draws or dispatches passed their node-test budget (the rest answered as misses)");
+            } else if frames.is_multiple_of(200) && total > 0 {
+                tracing::info!(frame = self.frame, most, total, cap, "rt step cap: node tests in a frame (the most of one budget)");
             }
         }
         let mut pages = Vec::new();
-        for i in 1..MEMORY_FAULTS as usize {
+        for i in 1..victory_shader::emit::RT_SLOT_AT as usize {
             // SAFETY: inside the faults' mapping; the GPU may be writing,
             // a number missed now is written again next frame.
             let at = unsafe { self.faults.1.add(i) };
@@ -1082,6 +1113,10 @@ pub(crate) fn ready(
         directory: directory.gpu(directory.span().0),
         faults: m.faults.2,
         base,
+        slot: {
+            static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % victory_shader::emit::RT_SLOTS
+        },
     })
 }
 

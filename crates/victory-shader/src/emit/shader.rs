@@ -118,6 +118,13 @@ pub const USER_ROOT_ADDRESS: u32 = 0x104;
 /// the group's width. Asked for by the structure builder's programs
 /// ([`crate::spill::is_spilled`]).
 pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
+/// `RootType::Other` code of a user-data dword the host computes: the number
+/// (below [`RT_SLOTS`]) of the node-test budget this draw or dispatch counts
+/// against (dword [`RT_SLOT_AT`] + number of the faults buffer): `VICTORY_RT_STEP_CAP`.
+pub const USER_RT_SLOT: u32 = 0x107;
+/// Budgets of ray node tests in the faults buffer, and where they begin.
+pub const RT_SLOTS: u32 = 64;
+pub const RT_SLOT_AT: u32 = 4016;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {

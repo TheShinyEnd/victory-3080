@@ -74,10 +74,26 @@ fn bvh_miss() -> bool {
 /// walk over a structure that is not right ends at its next node instead of
 /// hanging the card. The cap is a budget for the frame, not a bound for a
 /// walk; it is counted over all lanes.
+/// LOCAL: `VICTORY_RT_COUNT=1` (diagnostics): node tests over title memory are
+/// counted in dwords [`COUNT_AT`]..+4 of the faults buffer (all, box, box at a
+/// structure's first node (a walk's start: a TLAS or a BLAS entered), triangle);
+/// the host logs the frame's numbers.
+pub fn count_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RT_COUNT").is_some_and(|v| v == "1"))
+}
+
+/// First of the counters in the faults buffer ([`crate::emit::MEMORY_FAULTS`] - 16).
+pub const COUNT_AT: u32 = 4080;
+
+/// `VICTORY_RT_STEP_CAP=n`: millions of node tests one draw or dispatch may
+/// make (default 64; 0: no cap). The tests past it answer as misses, so a
+/// walk over a structure that is not right, or one too big for the card's
+/// 2 s, ends instead of removing the device.
 pub fn step_cap() -> Option<u32> {
     static CAP: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
     *CAP.get_or_init(|| {
-        let n: u32 = std::env::var("VICTORY_RT_STEP_CAP").ok()?.trim().parse().ok()?;
+        let n: u32 = std::env::var("VICTORY_RT_STEP_CAP").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(64);
         (n > 0).then_some(n.saturating_mul(1 << 20))
     })
 }
@@ -206,7 +222,12 @@ impl<'a> Lower<'a> {
             (Some(cap), BvhNodes::Memory { .. }) => {
                 let i32t = self.s.t.i32;
                 let faults = self.s.root_uav_handle(crate::emit::SLOT_FAULTS);
-                let (add, first, one, iu) = (self.s.m.i32(0), self.s.m.i32(0), self.s.m.i32(1), self.s.m.undef(i32t));
+                let (add, one, iu) = (self.s.m.i32(0), self.s.m.i32(1), self.s.m.undef(i32t));
+                // This dispatch's counter: dword RT_SLOT_AT + the host's number.
+                let slot = self.host_word(crate::native::RootType::Other(crate::emit::USER_RT_SLOT), 0, 0);
+                let (at, k2) = (self.s.m.i32(crate::emit::RT_SLOT_AT), self.s.m.i32(2));
+                let first = self.s.m.bin(head, Bin::Add, slot, at);
+                let first = self.s.m.bin(head, Bin::Shl, first, k2);
                 let before = self.s.op(
                     head,
                     "atomicBinOp.i32",
@@ -225,6 +246,21 @@ impl<'a> Lower<'a> {
         let pair = self.s.m.bin(head, Bin::And, pointer, k6);
         let is_box = self.s.m.cmp(head, pred::EQ, pair, k4);
         let is_triangle = self.s.m.cmp(head, pred::IULT, kind, k4);
+        if count_on() && matches!(nodes, BvhNodes::Memory { .. }) {
+            let i32t = self.s.t.i32;
+            let faults = self.s.root_uav_handle(crate::emit::SLOT_FAULTS);
+            let (add, iu, one, zero) = (self.s.m.i32(0), self.s.m.undef(i32t), self.s.m.i32(1), self.s.m.i32(0));
+            // A structure's first node: header 0x40 on, in 8-byte units a multiple of 32 plus 8, box32.
+            let (k1f, k0d) = (self.s.m.i32(0x1f), self.s.m.i32(13));
+            let low = self.s.m.bin(head, Bin::And, pointer, k1f);
+            let is_root = self.s.m.cmp(head, pred::EQ, low, k0d);
+            let root_box = self.s.m.bin(head, Bin::And, is_root, is_box);
+            let counts = [one, self.s.m.select(head, is_box, one, zero), self.s.m.select(head, root_box, one, zero), self.s.m.select(head, is_triangle, one, zero)];
+            for (k, v) in counts.into_iter().enumerate() {
+                let byte = self.s.m.i32(4 * (COUNT_AT + k as u32));
+                self.s.op(head, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[faults, add, byte, iu, iu, v]);
+            }
+        }
         let (box_block, leaf_block) = (self.s.m.new_block(), self.s.m.new_block());
         let (triangle_block, join) = (self.s.m.new_block(), self.s.m.new_block());
         self.s

@@ -162,11 +162,119 @@ fn morton(b: &Bounds, low: [f32; 3], scale: [f32; 3]) -> u64 {
     code
 }
 
+/// Build with the surface-area heuristic (binned) instead of Morton order:
+/// a better tree (fewer node tests per ray), 2-3 times the build time.
+static SAH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Chooses the tree builder ([`SAH`]).
+pub fn set_sah(on: bool) {
+    SAH.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+const BINS: usize = 16;
+
+/// Builds the binary tree over `order[lo..hi]` by binned SAH, reordering
+/// `order` as it goes (leaf `lo` is the position in the final order).
+fn split_sah(bin: &mut Binary, order: &mut [u32], leaves: &[Bounds], lo: usize, hi: usize) -> u32 {
+    let id = bin.left.len() as u32;
+    bin.left.push(u32::MAX);
+    bin.right.push(u32::MAX);
+    bin.lo.push(lo as u32);
+    bin.bounds.push(EMPTY);
+    if hi - lo == 1 {
+        bin.bounds[id as usize] = leaves[order[lo] as usize];
+        return id;
+    }
+    let centre = |i: u32, a: usize| 0.5 * (leaves[i as usize][a] + leaves[i as usize][3 + a]);
+    let (mut cl, mut ch) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
+    for &i in &order[lo..hi] {
+        for a in 0..3 {
+            cl[a] = cl[a].min(centre(i, a));
+            ch[a] = ch[a].max(centre(i, a));
+        }
+    }
+    let axis = (0..3).max_by(|&x, &y| (ch[x] - cl[x]).total_cmp(&(ch[y] - cl[y]))).unwrap_or(0);
+    let extent = ch[axis] - cl[axis];
+    let mut mid = (lo + hi) / 2;
+    let mut done = false;
+    if extent > 0.0 {
+        let k = BINS as f32 / extent;
+        let bin_of = |i: u32| (((centre(i, axis) - cl[axis]) * k) as usize).min(BINS - 1);
+        let mut counts = [0usize; BINS];
+        let mut boxes = [EMPTY; BINS];
+        for &i in &order[lo..hi] {
+            let b = bin_of(i);
+            counts[b] += 1;
+            boxes[b] = union(&boxes[b], &leaves[i as usize]);
+        }
+        // Sweep: the cost of cutting after each bin.
+        let mut right_area = [0f32; BINS];
+        let mut acc = EMPTY;
+        for b in (1..BINS).rev() {
+            acc = union(&acc, &boxes[b]);
+            right_area[b] = area(&acc);
+        }
+        let (mut best, mut best_cut) = (f32::INFINITY, 0usize);
+        let (mut acc, mut left_n) = (EMPTY, 0usize);
+        for b in 0..BINS - 1 {
+            acc = union(&acc, &boxes[b]);
+            left_n += counts[b];
+            let right_n = (hi - lo) - left_n;
+            if left_n == 0 || right_n == 0 {
+                continue;
+            }
+            let cost = area(&acc) * left_n as f32 + right_area[b + 1] * right_n as f32;
+            if cost < best {
+                best = cost;
+                best_cut = b + 1;
+            }
+        }
+        if best.is_finite() {
+            // Partition: bins below the cut first.
+            let (mut i, mut j) = (lo, hi);
+            while i < j {
+                if bin_of(order[i]) < best_cut {
+                    i += 1;
+                } else {
+                    j -= 1;
+                    order.swap(i, j);
+                }
+            }
+            if i > lo && i < hi {
+                mid = i;
+                done = true;
+            }
+        }
+    }
+    if !done {
+        // All the same centre (or no useful cut): by position.
+        order[lo..hi].sort_unstable_by(|&x, &y| centre(x, axis).total_cmp(&centre(y, axis)));
+    }
+    let l = split_sah(bin, order, leaves, lo, mid);
+    let r = split_sah(bin, order, leaves, mid, hi);
+    bin.left[id as usize] = l;
+    bin.right[id as usize] = r;
+    bin.bounds[id as usize] = union(&bin.bounds[l as usize], &bin.bounds[r as usize]);
+    id
+}
+
 impl Tree {
     /// A tree over leaves with finite bounds (`leaves[i]` for each `i` in
     /// `ids`), at least one.
     fn build(leaves: &[Bounds], ids: Vec<u32>) -> Tree {
         let n = ids.len();
+        if SAH.load(std::sync::atomic::Ordering::Relaxed) {
+            let mut order = ids;
+            let mut bin = Binary { left: Vec::with_capacity(2 * n), right: Vec::with_capacity(2 * n), lo: Vec::with_capacity(2 * n), bounds: Vec::with_capacity(2 * n) };
+            let root = split_sah(&mut bin, &mut order, leaves, 0, n);
+            let mut boxes = Vec::with_capacity(n / 2 + 1);
+            if bin.left[root as usize] == u32::MAX {
+                boxes.push([Child::Leaf(0, bin.bounds[root as usize]), Child::None, Child::None, Child::None]);
+            } else {
+                emit_box(&bin, root, &mut boxes);
+            }
+            return Tree { order, boxes };
+        }
         let mut centre_low = [f32::INFINITY; 3];
         let mut centre_high = [f32::NEG_INFINITY; 3];
         for &i in &ids {
@@ -181,11 +289,7 @@ impl Tree {
             let e = centre_high[a] - centre_low[a];
             if e > 0.0 { 2097151.0 / e } else { 0.0 }
         });
-        let mut keyed: Vec<(u64, u32)> = ids
-            .iter()
-            .map(|&i| (morton(&leaves[i as usize], centre_low, scale), i))
-            .collect();
-        keyed.sort_unstable();
+        let keyed = sorted_keys(&ids, leaves, centre_low, scale);
         let order: Vec<u32> = keyed.iter().map(|k| k.1).collect();
         let codes: Vec<u64> = keyed.iter().map(|k| k.0).collect();
         let mut bin = Binary {
@@ -204,6 +308,57 @@ impl Tree {
         }
         Tree { order, boxes }
     }
+}
+
+/// The leaves' Morton codes with their indices, in order. Big lists are
+/// keyed and sorted in pieces on threads and merged.
+fn sorted_keys(ids: &[u32], leaves: &[Bounds], low: [f32; 3], scale: [f32; 3]) -> Vec<(u64, u32)> {
+    const BIG: usize = 1 << 15;
+    let key = |piece: &[u32]| -> Vec<(u64, u32)> {
+        let mut v: Vec<(u64, u32)> = piece.iter().map(|&i| (morton(&leaves[i as usize], low, scale), i)).collect();
+        v.sort_unstable();
+        v
+    };
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8);
+    if ids.len() < BIG || threads < 2 {
+        return key(ids);
+    }
+    let size = ids.len().div_ceil(threads);
+    let mut runs: Vec<Vec<(u64, u32)>> = std::thread::scope(|s| {
+        let handles: Vec<_> = ids.chunks(size).map(|piece| s.spawn(move || key(piece))).collect();
+        handles.into_iter().map(|h| h.join().expect("a sort thread")).collect()
+    });
+    while runs.len() > 1 {
+        runs = std::thread::scope(|s| {
+            let mut handles = Vec::new();
+            let mut it = runs.into_iter();
+            while let Some(a) = it.next() {
+                match it.next() {
+                    Some(b) => handles.push(s.spawn(move || merge(a, b))),
+                    None => handles.push(s.spawn(move || a)),
+                }
+            }
+            handles.into_iter().map(|h| h.join().expect("a merge thread")).collect()
+        });
+    }
+    runs.pop().unwrap_or_default()
+}
+
+fn merge(a: Vec<(u64, u32)>, b: Vec<(u64, u32)>) -> Vec<(u64, u32)> {
+    let mut out = Vec::with_capacity(a.len() + b.len());
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        if a[i] <= b[j] {
+            out.push(a[i]);
+            i += 1;
+        } else {
+            out.push(b[j]);
+            j += 1;
+        }
+    }
+    out.extend_from_slice(&a[i..]);
+    out.extend_from_slice(&b[j..]);
+    out
 }
 
 fn split(bin: &mut Binary, codes: &[u64], order: &[u32], leaves: &[Bounds], lo: usize, hi: usize) -> u32 {
@@ -427,6 +582,112 @@ pub fn build_blas_with(tris: &[Tri], wide: bool) -> Vec<u8> {
     }
     header(&mut bytes, BLAS_FLAGS, tree.order.len(), &all, pointer(HEADER, if wide { KIND_BOX32 } else { KIND_BOX16 }), leaf_at);
     bytes
+}
+
+/// Whether `bytes` is a structure a walker cannot get lost in: a whole number
+/// of 64-byte blocks, the root NONE or a box inside it, every box child NONE or
+/// a node inside it, and a box's box children AFTER it (preorder: no cycle, so
+/// a walk is as long as the tree is deep), leaves after the boxes, bounds not
+/// NaN-ish in the root. Checked before a structure is published.
+pub fn validate(bytes: &[u8]) -> bool {
+    let n = bytes.len();
+    if n < HEADER || n % 64 != 0 {
+        return false;
+    }
+    let root = rd(bytes, 0x30);
+    if root == NO_NODE {
+        return true;
+    }
+    let (box_at, leaf_at) = (rd(bytes, 0x28) as usize, rd(bytes, 0x34) as usize);
+    let size = match root & 7 {
+        KIND_BOX32 => BOX32,
+        KIND_BOX16 => BOX16,
+        _ => return false,
+    };
+    if box_at != HEADER || leaf_at < box_at || leaf_at > n || (leaf_at - box_at) % size != 0 || ((root >> 3) as usize) << 6 != HEADER {
+        return false;
+    }
+    let leaf_kinds = if rd(bytes, 0) & 0x8000_0000 != 0 { (0u32, TRIANGLE) } else { (KIND_INSTANCE, INSTANCE) };
+    let mut at = box_at;
+    while at < leaf_at {
+        let mut any = false;
+        for c in 0..4 {
+            let p = rd(bytes, at + 4 * c);
+            if p == NO_NODE {
+                continue;
+            }
+            any = true;
+            let off = ((p >> 3) as usize) << 6;
+            let kind = p & 7;
+            if off + if kind == KIND_BOX16 || kind == KIND_BOX32 { size } else { leaf_kinds.1 } > n {
+                return false;
+            }
+            if kind == KIND_BOX16 || kind == KIND_BOX32 {
+                // A box child of the same kind, strictly later.
+                if kind != root & 7 || off <= at || off < box_at || off >= leaf_at || (off - box_at) % size != 0 {
+                    return false;
+                }
+            } else if kind != leaf_kinds.0 || off < leaf_at || (off - leaf_at) % leaf_kinds.1 != 0 {
+                return false;
+            }
+        }
+        if !any {
+            // A box with no child: reachable, harmless, but not ours.
+            return false;
+        }
+        at += size;
+    }
+    true
+}
+
+/// A walk over the tree from the root, for structures made by the console's
+/// own code (the DLL's rehydration), whose layout is not ours: every pointer
+/// inside the structure, no node reached twice (so no cycle), no instance or
+/// procedural node in a bottom-level structure. At most one visit per 64
+/// bytes, so it is as long as the structure.
+pub fn validate_graph(bytes: &[u8]) -> bool {
+    let n = bytes.len();
+    if n < HEADER || n % 64 != 0 {
+        return false;
+    }
+    let root = rd(bytes, 0x30);
+    if root == NO_NODE {
+        return true;
+    }
+    let mut seen = vec![false; n / 64];
+    let mut stack = vec![root];
+    while let Some(p) = stack.pop() {
+        let off = ((p >> 3) as usize) << 6;
+        let kind = p & 7;
+        let size = match kind {
+            KIND_BOX32 => BOX32,
+            0..=4 => 64,
+            _ => return false,
+        };
+        if off < HEADER || off + size > n {
+            return false;
+        }
+        // (Triangles 0-3 of a node are reached by pointers of their own, so
+        // only boxes count as visited.)
+        if kind >= KIND_BOX16 {
+            if seen[off / 64] || (size == BOX32 && seen[off / 64 + 1]) {
+                return false;
+            }
+            seen[off / 64] = true;
+            if size == BOX32 {
+                seen[off / 64 + 1] = true;
+            }
+        }
+        if kind >= KIND_BOX16 {
+            for c in 0..4 {
+                let child = rd(bytes, off + 4 * c);
+                if child != NO_NODE {
+                    stack.push(child);
+                }
+            }
+        }
+    }
+    true
 }
 
 /// Refits the structure in `bytes` (a [`build_blas`] result, or one a
@@ -676,9 +937,15 @@ fn rd(bytes: &[u8], at: usize) -> u32 {
 /// the way a trace program does: a stack, the node test of
 /// [`bvh::intersect`], the hit distance `numerator / denominator`.
 pub fn walk_blas(bytes: &[u8], ray: &bvh::Ray) -> Option<Hit> {
+    walk_blas_counted(bytes, ray).0
+}
+
+/// [`walk_blas`], and how many nodes it tested.
+pub fn walk_blas_counted(bytes: &[u8], ray: &bvh::Ray) -> (Option<Hit>, usize) {
+    let mut tests = 0;
     let root = rd(bytes, 0x30);
     if root == NO_NODE {
-        return None;
+        return (None, 0);
     }
     let mut best: Option<Hit> = None;
     let mut extent = ray.extent;
@@ -688,6 +955,7 @@ pub fn walk_blas(bytes: &[u8], ray: &bvh::Ray) -> Option<Hit> {
         let kind = p & 7;
         let mut r = *ray;
         r.extent = extent;
+        tests += 1;
         let out = bvh::intersect(&words(bytes, at), kind, &r, true);
         if kind >= 4 {
             for &c in out.iter().rev() {
@@ -704,7 +972,7 @@ pub fn walk_blas(bytes: &[u8], ray: &bvh::Ray) -> Option<Hit> {
             }
         }
     }
-    best
+    (best, tests)
 }
 
 /// The closest hit in a top-level structure whose instances' bottom-level
@@ -877,6 +1145,83 @@ mod tests {
             assert!(lo <= x && x <= hi, "{x}: {lo} {hi}");
             assert!(x.abs() > 60000.0 || (hi - lo).abs() <= x.abs() * 2.0e-3 + 1.2e-7, "{x}: {lo} {hi}");
         }
+    }
+
+    #[test]
+    fn a_big_blas_sorted_on_threads_is_the_same_as_one_sorted_on_one() {
+        let mut rng = Rng(11);
+        let tris = soup(&mut rng, 70_000, 4);
+        let bytes = build_blas(&tris);
+        for ray in rays(&mut rng, 150) {
+            same(walk_blas(&bytes, &ray), brute(&tris, &ray));
+        }
+    }
+
+    /// Node tests per ray, Morton against SAH, box32 and box16 (printed with
+    /// `--nocapture`; the assertion is only that SAH is not worse).
+    #[test]
+    fn sah_trees_need_fewer_node_tests() {
+        let mut rng = Rng(5150);
+        // Triangles of mixed sizes, clustered.
+        let tris: Vec<Tri> = (0..6000)
+            .map(|k| {
+                let cluster = rng.point(60.0);
+                let c = [cluster[0] + rng.unit() * 6.0, cluster[1] + rng.unit() * 6.0, cluster[2] + rng.unit() * 2.0];
+                let size = if k % 7 == 0 { 4.0 } else { 0.6 };
+                let v = std::array::from_fn(|_| {
+                    let o = rng.point(size);
+                    [c[0] + o[0], c[1] + o[1], c[2] + o[2]]
+                });
+                Tri { v, geometry: 0, primitive: k, flags: 0 }
+            })
+            .collect();
+        let rs = rays(&mut rng, 600);
+        let mut result = Vec::new();
+        for sah in [false, true] {
+            set_sah(sah);
+            for wide in [true, false] {
+                let bytes = build_blas_with(&tris, wide);
+                let tests: usize = rs.iter().map(|r| walk_blas_counted(&bytes, r).1).sum();
+                for r in rs.iter().take(100) {
+                    same(walk_blas(&bytes, r), brute(&tris, r));
+                }
+                result.push((sah, wide, tests as f64 / rs.len() as f64, bytes.len()));
+            }
+        }
+        set_sah(false);
+        for r in &result {
+            println!("sah {} box32 {}: {:.1} node tests per ray, {} bytes", r.0, r.1, r.2, r.3);
+        }
+        assert!(result[2].2 <= result[0].2 * 1.05);
+    }
+
+    #[test]
+    fn built_structures_validate_and_broken_ones_do_not() {
+        let mut rng = Rng(3);
+        let tris = soup(&mut rng, 900, 2);
+        for wide in [true, false] {
+            let b = build_blas_with(&tris, wide);
+            assert!(validate(&b));
+            // A box that points at itself, or at nothing inside.
+            let mut cyc = b.clone();
+            cyc[HEADER..HEADER + 4].copy_from_slice(&pointer(HEADER, if wide { KIND_BOX32 } else { KIND_BOX16 }).to_le_bytes());
+            assert!(!validate(&cyc));
+            let mut out = b.clone();
+            out[HEADER + 4..HEADER + 8].copy_from_slice(&pointer(b.len() + 64, 0).to_le_bytes());
+            assert!(!validate(&out));
+            assert!(!validate(&b[..b.len() - 64]));
+        }
+        assert!(validate_graph(&build_blas_with(&tris, true)) && validate_graph(&build_blas_with(&tris, false)));
+        assert!(validate_graph(&build_blas(&[])));
+        let mut cyc = build_blas(&tris);
+        cyc[HEADER..HEADER + 4].copy_from_slice(&pointer(HEADER, KIND_BOX32).to_le_bytes());
+        assert!(!validate_graph(&cyc));
+        assert!(!validate_graph(&[0u8; 128]));
+        assert!(validate(&build_blas(&[])));
+        assert!(!validate(&[0u8; 128]), "zeros: a root that points at the header");
+        let one = [Instance { transform: [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0], id: 0, mask: 255, contribution: 0, flags: 0, blas: 0x100, root: pointer(HEADER, KIND_BOX32), bounds: [0.0, 0.0, 0.0, 1.0, 1.0, 1.0] }];
+        assert!(validate(&build_tlas(&one)));
+        assert!(validate(&build_tlas(&[])));
     }
 
     #[test]
