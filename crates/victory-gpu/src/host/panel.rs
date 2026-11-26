@@ -27,7 +27,7 @@ const GLYPH: (u32, u32) = (5, 7);
 const CELL: (u32, u32) = (6, 9);
 /// Characters in a line, lines, and the box's rim in dots.
 const COLUMNS: u32 = 40;
-const LINES: u32 = 9;
+const LINES: u32 = 11;
 const RIM: u32 = 3;
 
 /// The texts are put into one of these in turn: the card reads the others,
@@ -159,7 +159,7 @@ fn lit(lines: &[String], x: u32, y: u32) -> bool {
 fn colours(format: DXGI_FORMAT) -> Option<[&'static [u8]; 2]> {
     Some(match format {
         DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM => [&[0, 0, 0, 0xFF], &[0xFF; 4]],
-        DXGI_FORMAT_R10G10B10A2_UNORM => [&[0, 0, 0, 0xC0], &[0xFF; 4]],
+        DXGI_FORMAT_R10G10B10A2_UNORM => [&[0, 0, 0, 0xC0], crate::hdr::panel_white()],
         // Halves of 0 and 1.
         DXGI_FORMAT_R16G16B16A16_FLOAT => [
             &[0, 0, 0, 0, 0, 0, 0, 0x3C],

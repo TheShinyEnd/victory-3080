@@ -35,6 +35,7 @@ mod draw;
 pub mod dxgi;
 pub mod fence;
 pub mod frame;
+pub mod hdr;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod book;
 #[cfg(windows)]

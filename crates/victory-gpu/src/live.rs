@@ -84,7 +84,7 @@ pub(crate) struct Menu {
 }
 
 #[cfg(windows)]
-const ROWS: usize = 7;
+const ROWS: usize = 9;
 #[cfg(windows)]
 const STAGES: [u64; 8] = [0, 32, 64, 128, 192, 256, 384, 512];
 
@@ -130,10 +130,11 @@ impl Menu {
         }
     }
 
-    /// The page's lines, 40 characters at most.
+    /// The page's lines, 40 characters at most. (HDR OUTPUT and SCREEN only show what the start decided.)
     pub(crate) fn lines(&self) -> Vec<String> {
         let share = crate::ambient::share_now();
         let stage = stage_now();
+        let hdr = crate::hdr::summary();
         let on = |name: &str| if env_f(name) == Some(1.0) { "ON" } else { "OFF" };
         let rows = [
             ("AMBIENT SHARE", if share > 0.0 { format!("{share:.1}") } else { "OFF".to_owned() }),
@@ -143,6 +144,8 @@ impl Menu {
             ("TEXTURE MB/FRAME", if stage == 0 { "AUTO".to_owned() } else { stage.to_string() }),
             ("NAN SCRUB RESTART", on("VICTORY_NAN_SCRUB").to_owned()),
             ("RAY MISS RESTART", on("VICTORY_BVH_MISS").to_owned()),
+            ("HDR OUTPUT", hdr.0),
+            ("SCREEN", hdr.1),
         ];
         let mut lines = vec!["QUALITY  F8 CLOSE  ARROWS".to_owned()];
         for (i, (label, value)) in rows.iter().enumerate() {

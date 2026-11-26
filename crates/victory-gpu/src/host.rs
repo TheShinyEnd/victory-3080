@@ -3447,6 +3447,11 @@ struct RelayFetch {
     suspects: torn::Suspects,
     /// What earlier fetches brought of flights not landed yet.
     had: crate::land::Had,
+    /// With chunked fetches (`land::chunks`): copy lists for the chunks after
+    /// the first (which uses `list`).
+    more: Vec<Prelude>,
+    /// Landings in a row for which `buffer` was four times too big.
+    small: u32,
 }
 
 /// The thread that lands flights ([`relay`]): as soon as the card has run
@@ -4654,6 +4659,8 @@ impl Host {
                 buffer: None,
                 suspects: torn::Suspects::default(),
                 had: crate::land::Had::default(),
+                more: Vec::new(),
+                small: 0,
             })
         }
     }
@@ -4729,6 +4736,10 @@ impl Host {
                                 upcheck::fetched(r.shadow.id(), lo);
                             }
                             seen.insert((copy, lo, hi));
+                            land::count(
+                                if r.compared { land::stat::FETCH_FLAGGED } else { land::stat::FETCH_UNCOMPARED },
+                                (hi - lo) as u64,
+                            );
                             pieces.push((r.shadow.clone(), lo, hi, total));
                             total += (hi - lo) as u64;
                         }
@@ -4784,13 +4795,38 @@ impl Host {
         let Some(f) = fetch.as_mut() else {
             fail(format_args!("no list, fence or event to fetch what shaders wrote to the card's memory (VICTORY_RELAY=1)"));
         };
-        if f.buffer.as_ref().is_none_or(|b| b.2 < total) {
-            let size = total.next_multiple_of(16 << 20);
-            f.buffer = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
+        // A buffer only ever grew: one spike of landings (a streaming burst)
+        // left it, in shared memory, at the size of that burst for good. Now
+        // one that has been over 128 MB and four times too big for 120
+        // landings in a row is made again at the size wanted. (The last
+        // fetch was waited for; nothing of the old buffer is in use.)
+        let want = total.next_multiple_of(16 << 20);
+        let too_big = land::trim_on() && f.buffer.as_ref().is_some_and(|b| b.2 > (128 << 20) && b.2 >= want * 4);
+        f.small = if too_big { f.small + 1 } else { 0 };
+        let trimmed = f.small >= 120;
+        if trimmed || f.buffer.as_ref().is_none_or(|b| b.2 < total) {
+            if let Some(old) = f.buffer.as_ref().filter(|_| trimmed) {
+                land::count(land::stat::TRIMMED, old.2 - want);
+            }
+            f.small = 0;
+            f.buffer = self.shared_buffer(want).map(|(buffer, data)| (buffer, data as usize, want));
         }
         let Some((buffer, data, _)) = f.buffer.clone() else {
             fail(format_args!("no memory to fetch what shaders wrote to the card's memory ({total} bytes, VICTORY_RELAY=1)"));
         };
+        // On the copy queue, in chunks: the merge of one runs while the next
+        // is on its way. (Not with the check of torn pieces, which looks at
+        // the whole fetch, nor on the drawing queue, whose fetch runs behind
+        // what was sent: both as before.)
+        let chunks = if f.queue.is_some() && check.is_none() && land::on() { land::chunks(total) } else { 1 };
+        if chunks > 1 {
+            let written = self.relay_fetch_chunked(f, &pieces, chunks, &buffer, data, behind, meanwhile);
+            COPY_BACK[1].fetch_add(written, Ordering::Relaxed);
+            // (On the copy queue nothing was sent behind the fetch: `ahead` 0.)
+            f.had.fetched(0, pieces.iter().map(|(shadow, lo, hi, _)| (shadow.id(), shadow.span().0 as usize + lo, hi - lo)));
+            crate::shadow::relay_fetched(behind);
+            return;
+        }
         f.sent += 1;
         let ((allocator, list), fence, event, sent) = (f.list.clone(), f.fence.clone(), f.event, f.sent);
         let copy_queue = f.queue.clone();
@@ -4911,6 +4947,143 @@ impl Host {
         }
         // Sends up to `after` are of no use to any later merge.
         crate::shadow::relay_fetched(after);
+    }
+
+    /// [`Host::relay_card_back`]'s fetch on the copy queue, cut in `chunks`
+    /// runs of whole jobs ([`land::jobs`]: pieces of the same 64 KiB block
+    /// stay together): each chunk is its own list, signalled behind itself,
+    /// and the merge of one chunk runs while the card brings the next. Each
+    /// byte is fetched, compared and merged exactly as in one fetch (the jobs
+    /// lie in different blocks of title memory, so their order does not
+    /// matter); the landing is done, whole, when this returns. Returns the
+    /// bytes put into title memory.
+    #[allow(clippy::too_many_arguments)]
+    fn relay_fetch_chunked(
+        &self,
+        f: &mut RelayFetch,
+        pieces: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)],
+        chunks: usize,
+        buffer: &ID3D12Resource,
+        data: usize,
+        behind: u64,
+        meanwhile: &mut dyn FnMut(),
+    ) -> u64 {
+        use crate::land;
+        let titles: Vec<(usize, usize)> = pieces.iter().map(|(shadow, lo, hi, _)| (shadow.span().0 as usize + lo, hi - lo)).collect();
+        let jobs = land::jobs(&titles);
+        // Jobs in groups of about equal bytes.
+        let bytes = |j: &std::ops::Range<usize>| titles[j.clone()].iter().map(|t| t.1).sum::<usize>();
+        let all: usize = jobs.iter().map(bytes).sum();
+        let per = all.div_ceil(chunks).max(1);
+        let mut groups: Vec<std::ops::Range<usize>> = Vec::new();
+        let (mut from, mut have) = (0usize, 0usize);
+        for (i, j) in jobs.iter().enumerate() {
+            have += bytes(j);
+            if have >= per && groups.len() + 1 < chunks {
+                groups.push(from..i + 1);
+                (from, have) = (i + 1, 0);
+            }
+        }
+        if from < jobs.len() {
+            groups.push(from..jobs.len());
+        }
+        let Some(queue) = f.queue.clone() else {
+            fail(format_args!("no copy queue for a fetch in chunks (VICTORY_FETCH_CHUNKS)"));
+        };
+        while f.more.len() + 1 < groups.len() {
+            // SAFETY: plain object creation.
+            let made = unsafe {
+                (|| -> windows::core::Result<Prelude> {
+                    let allocator: ID3D12CommandAllocator = self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY)?;
+                    let list: ID3D12GraphicsCommandList =
+                        self.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None)?;
+                    list.Close()?;
+                    Ok((allocator, list))
+                })()
+            };
+            match made {
+                Ok(list) => f.more.push(list),
+                Err(e) => fail(format_args!("no copy list for a fetch in chunks ({e}, VICTORY_FETCH_CHUNKS)")),
+            }
+        }
+        let (fence, event, base) = (f.fence.clone(), f.event, f.sent);
+        f.sent += groups.len() as u64;
+        let waiting = std::time::Instant::now();
+        // SAFETY: every list's last run was waited for by this thread (all
+        // chunks of the last fetch were); live buffers (the copies are held by
+        // the plans); the fence and the event are this thread's.
+        let ran = unsafe {
+            (|| -> windows::core::Result<()> {
+                let _fetching = crate::timeline::span("landing: fetching pieces");
+                for (c, g) in groups.iter().enumerate() {
+                    let (allocator, list) = if c == 0 { &f.list } else { &f.more[c - 1] };
+                    allocator.Reset()?;
+                    list.Reset(allocator, None)?;
+                    for (shadow, lo, hi, at) in &pieces[jobs[g.start].start..jobs[g.end - 1].end] {
+                        list.CopyBufferRegion(buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
+                    }
+                    list.Close()?;
+                    let lists = [Some(list.cast::<ID3D12CommandList>()?)];
+                    queue.ExecuteCommandLists(&lists);
+                    queue.Signal(&fence, base + c as u64 + 1)?;
+                }
+                Ok(())
+            })()
+        };
+        if let Err(e) = ran {
+            fail(format_args!("what shaders wrote to the card's memory could not be fetched ({e}, VICTORY_FETCH_CHUNKS)"));
+        }
+        meanwhile();
+        let put = std::sync::atomic::AtomicU64::new(0);
+        let (mut blocked, mut merging) = (0u64, std::time::Duration::ZERO);
+        for (c, g) in groups.iter().enumerate() {
+            let waited = std::time::Instant::now();
+            // SAFETY: this thread's fence and event.
+            unsafe {
+                if let Err(e) = fence.SetEventOnCompletion(base + c as u64 + 1, event) {
+                    fail(format_args!("what shaders wrote to the card's memory could not be waited for ({e}, VICTORY_FETCH_CHUNKS)"));
+                }
+                #[cfg(feature = "diagnostics")]
+                let _card = crate::timeline::card_wait(None);
+                WaitForSingleObject(event, INFINITE);
+            }
+            blocked += waited.elapsed().as_micros() as u64;
+            let merged = std::time::Instant::now();
+            let _merging = crate::timeline::span("landing: merging fetched pieces");
+            let jobs = &jobs;
+            land::each(g.len(), &|k| {
+                let working = std::time::Instant::now();
+                let mut notes = land::Notes::default();
+                for run in pieces[jobs[g.start + k].clone()].chunk_by(|a, b| std::sync::Arc::ptr_eq(&a.0, &b.0)) {
+                    let addressed: Vec<(usize, usize, usize)> =
+                        run.iter().map(|(_, lo, hi, at)| (*lo, *hi, data + *at as usize)).collect();
+                    // SAFETY: the mapping of the fetched bytes: this chunk's
+                    // copy has run (its fence value was reached), and the
+                    // next chunk's goes to other bytes of the buffer.
+                    put.fetch_add(unsafe { run[0].0.land_card(&addressed, behind, &mut notes) }, Ordering::Relaxed);
+                }
+                notes.flush();
+                land::spent(land::stat::CARD_ALL, working);
+            });
+            merging += merged.elapsed();
+        }
+        land::count(land::stat::JOBS, jobs.len() as u64);
+        land::count(land::stat::CARD, merging.as_micros() as u64);
+        land::count(land::stat::CHUNKED, 1);
+        land::count(land::stat::CHUNKS, groups.len() as u64);
+        land::count(land::stat::CHUNK_WAIT, blocked);
+        let _ = waiting;
+        // (What the relay line calls its fetches: the time blocked.)
+        let us = blocked;
+        RELAY_STATS[3].fetch_add(blocked, Ordering::Relaxed);
+        {
+            use crate::shadow::CARD_STATS;
+            CARD_STATS[3].fetch_add(pieces.len() as u64, Ordering::Relaxed);
+            CARD_STATS[4].fetch_add(all as u64, Ordering::Relaxed);
+            CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
+            CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
+        }
+        put.into_inner()
     }
 
     /// [`relay`], on the thread that lands flights: `items` are the first
@@ -6982,7 +7155,9 @@ impl HostList {
     ) {
         let mut deferred = self.deferred();
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
+        victory_core::prof_count!("refresh.defer.calls", 1);
         if deferred.refreshed.insert(key) {
+            victory_core::prof_count!("refresh.defer.new_in_list", len >> 10);
             deferred
                 .copies
                 .push(Step::Refresh(shadow.clone(), address, len));
@@ -7402,7 +7577,7 @@ impl HostList {
                         copies += 1;
                     }
                     batch.fill();
-                    batch.title_written();
+                    batch.title_written_at(dst, len);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
@@ -7432,7 +7607,7 @@ impl HostList {
                     let free = !touches(air, p.src, p.src + p.len) && !touches(air, p.dst, p.dst + p.len);
                     batch.fill();
                     if free {
-                        batch.title_written();
+                        batch.title_written_at(p.dst, p.len);
                     }
                     if let Some(bytes) = p.prepare(free) {
                         batch.placed.push((p.shadow.clone(), p.dst, bytes));
@@ -7660,6 +7835,7 @@ fn split_line(frames: f64) {
         s[2] / 1048576.0,
         s[3],
     );
+    tracing::info!("{}", crate::watch::watch_line(frames));
     tracing::info!(
         "the pass over the heap's views per frame: {:.1} ms looking at slots, {:.1} their copies' spans and refreshes, {:.1} textures; the \
          first two beside the recording (VICTORY_HEAP_PASS_ASIDE), {:.1} ms waited for at the lists' close",
@@ -7748,6 +7924,35 @@ struct Batch {
     /// `ahead` holds everything the submission refreshes
     /// ([`Batch::refresh_front`]).
     front: bool,
+    /// `ahead` by where each span starts (small ones) and the big ones, made
+    /// when a copy into title memory first asks which are touched
+    /// ([`Batch::title_written_at`]).
+    ahead_sorted: Option<(std::collections::BTreeSet<(usize, usize)>, Vec<usize>)>,
+}
+
+/// Whether the refreshes of a flush are handed to the threads longest range
+/// first (on; `VICTORY_REFRESH_LONGEST_FIRST=0` turns it off): the one big
+/// copy's refresh (the 174 MB heap, 20-28 ms) came when the others were done,
+/// and the submitting thread waited for it alone. Only the order changes.
+fn longest_first() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_LONGEST_FIRST").is_none_or(|v| v != "0"))
+}
+
+/// Whether a flush of very many refreshes tells those that copy nothing on
+/// the submitting thread, before the threads are woken
+/// (on; `VICTORY_REFRESH_SURVIVORS=0` turns it off).
+fn survivors() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_SURVIVORS").is_none_or(|v| v != "0"))
+}
+
+/// Whether a copy into title memory makes only the copies it touches due
+/// again among those refreshed in front (`VICTORY_AHEAD_KEEP=0` turns it off; on by
+/// default).
+fn ahead_keep() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_AHEAD_KEEP").is_none_or(|v| v != "0"))
 }
 
 /// Whether the copies that a submission's shaders write are brought up to
@@ -7972,7 +8177,9 @@ impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
         let key = std::sync::Arc::as_ptr(shadow) as usize;
+        victory_core::prof_count!("refresh.batch.add", 1);
         if self.ahead.get(&key).is_some_and(|&(from, to)| from <= address && end <= to) {
+            victory_core::prof_count!("refresh.batch.covered_ahead", 1);
             return;
         }
         match self.index.get(&key) {
@@ -8040,7 +8247,73 @@ impl Batch {
     fn title_written(&mut self) {
         self.flush();
         self.ahead.clear();
+        self.ahead_sorted = None;
         self.textures.clear();
+    }
+
+    /// [`Batch::title_written`] for a step that writes title memory
+    /// `[at, at + len)` and nothing else (a copy into it). With
+    /// `VICTORY_AHEAD_KEEP` (on) and the refreshes done in front of the steps
+    /// ([`refresh_front`]), only the copies refreshed ahead whose range the
+    /// write touches (or that show the same pages at another address, as
+    /// [`crate::watch::wrote`] knows them) are due again; the others'
+    /// title bytes are as the front pass found them (the premise of that
+    /// pass: only a step of ours writes title memory under a submission).
+    fn title_written_at(&mut self, at: usize, len: usize) {
+        if !(self.front && ahead_keep()) || len == 0 {
+            return self.title_written();
+        }
+        let _p = victory_core::prof_scope!("refresh.ahead_keep");
+        self.flush();
+        self.textures.clear();
+        if self.ahead_sorted.is_none() {
+            // Spans of 1 MiB and more are few: looked through each time;
+            // the others by where they start.
+            const BIG: usize = 1 << 20;
+            let mut small = std::collections::BTreeSet::new();
+            let mut big = Vec::new();
+            for (&key, &(from, to)) in &self.ahead {
+                if to - from >= BIG {
+                    big.push(key);
+                } else {
+                    small.insert((from, key));
+                }
+            }
+            self.ahead_sorted = Some((small, big));
+        }
+        let mut hit: Vec<(usize, usize)> = Vec::new();
+        let hits = |at: usize, len: usize, this: &Self, hit: &mut Vec<(usize, usize)>| {
+            let end = at.saturating_add(len);
+            let (small, big) = this.ahead_sorted.as_ref().expect("made above");
+            for &key in big {
+                if let Some(&(from, to)) = this.ahead.get(&key)
+                    && from < end
+                    && to > at
+                {
+                    hit.push((from, key));
+                }
+            }
+            for &(from, key) in small.range((at.saturating_sub(1 << 20), 0)..(end, 0)) {
+                if this.ahead.get(&key).is_some_and(|&(_, to)| to > at) {
+                    hit.push((from, key));
+                }
+            }
+        };
+        hits(at, len, self, &mut hit);
+        for (_, others) in crate::watch::elsewhere(at, len) {
+            for other in others {
+                hits(other & !0xffff, 1 << 16, self, &mut hit);
+            }
+        }
+        victory_core::prof_count!("refresh.ahead_keep.dropped", hit.len());
+        victory_core::prof_count!("refresh.ahead_keep.kept", self.ahead.len().saturating_sub(hit.len()));
+        for (from, key) in hit {
+            self.ahead.remove(&key);
+            if let Some((small, big)) = self.ahead_sorted.as_mut() {
+                small.remove(&(from, key));
+                big.retain(|&k| k != key);
+            }
+        }
     }
 
     /// Before the steps of `runs` ([`refresh_front`]), a new part of the
@@ -8080,6 +8353,7 @@ impl Batch {
             .filter_map(|(key, from, to)| Some((copies.remove(&key)?, from, to)))
             .collect();
         self.front = true;
+        self.ahead_sorted = None;
         for (shadow, from, to) in &spans {
             self.ahead.insert(std::sync::Arc::as_ptr(shadow) as usize, (*from, *to));
         }
@@ -8096,20 +8370,40 @@ impl Batch {
         const FEW: usize = 256;
         let mut spans = spans;
         let many = spans.len() > FEW;
+        victory_core::prof_count!("refresh.front.entries", spans.len());
         if !many {
             #[cfg(feature = "diagnostics")]
             let all = spans.len();
+            let _p = victory_core::prof_scope!("refresh.front.precheck");
             spans.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
             #[cfg(feature = "diagnostics")]
             FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
         }
+        victory_core::prof_count!("refresh.front.after_precheck", spans.len());
         let ahead = spans.len() > 1;
         if ahead {
+            let _p = victory_core::prof_scope!("refresh.front.ask_ahead");
             let ranges: Vec<(usize, usize)> = spans.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2)).collect();
             crate::watch::ask_ahead(&ranges);
         }
+        // With `VICTORY_REFRESH_SURVIVORS=1`: the many that copy nothing are
+        // told so here, now the asking is in, and only the others go to
+        // the threads (a number each from one counter was most of what the
+        // threads did for them).
+        let many = if many && survivors() {
+            let _p = victory_core::prof_scope!("refresh.front.survivors");
+            spans.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
+            victory_core::prof_count!("refresh.front.survivors", spans.len());
+            false
+        } else {
+            many
+        };
+        if longest_first() {
+            spans.sort_by_key(|s| std::cmp::Reverse(s.2 - s.1));
+        }
         #[cfg(feature = "diagnostics")]
         FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
+        let _wide = victory_core::prof_scope!("refresh.front.wide");
         crate::shadow::wide_each(spans.len() + due.len(), move |i| {
             // The textures first: they are the longer pieces.
             let Some(i) = i.checked_sub(due.len()) else {
@@ -8162,6 +8456,7 @@ impl Batch {
             .into_iter()
             .filter_map(|(key, from, to)| Some((copies.get(&key)?.clone(), from, to)))
             .collect();
+        self.ahead_sorted = None;
         for (shadow, from, to) in &due {
             self.ahead.insert(std::sync::Arc::as_ptr(shadow) as usize, (*from, *to));
         }
@@ -8259,6 +8554,7 @@ impl Batch {
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
             let all = self.refreshes.len();
+            let _p = victory_core::prof_scope!("refresh.flush.precheck");
             self.refreshes.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
@@ -8266,8 +8562,10 @@ impl Batch {
         }
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
+        victory_core::prof_count!("refresh.flush.entries", self.refreshes.len());
         let ahead = self.refreshes.len() > 1;
         if ahead {
+            let _p = victory_core::prof_scope!("refresh.flush.ask_ahead");
             let started = std::time::Instant::now();
             let ranges: Vec<(usize, usize)> = self
                 .refreshes
@@ -8277,6 +8575,15 @@ impl Batch {
                 .collect();
             crate::watch::ask_ahead(&ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
+        let told = light && self.refreshes.len() > FEW && survivors();
+        if told {
+            let _p = victory_core::prof_scope!("refresh.flush.survivors");
+            self.refreshes.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
+            victory_core::prof_count!("refresh.flush.survivors", self.refreshes.len());
+        }
+        if light && longest_first() {
+            self.refreshes.sort_by_key(|r| std::cmp::Reverse(r.2 - r.1));
         }
         if wide_refresh() && self.refreshes.len() >= 4 {
             // Each copy on its own, several at a time: a copy's refresh
@@ -8289,9 +8596,10 @@ impl Batch {
             if light {
                 // A number to a free thread, not a job to each copy.
                 let refreshes = std::mem::take(&mut self.refreshes);
+                let _wide = victory_core::prof_scope!("refresh.flush.wide");
                 crate::shadow::wide_each(refreshes.len(), move |i| {
                     let (shadow, from, to) = &refreshes[i];
-                    if refreshes.len() > FEW && shadow.nothing_new(*from, *to - *from) {
+                    if !told && refreshes.len() > FEW && shadow.nothing_new(*from, *to - *from) {
                         #[cfg(feature = "diagnostics")]
                         FLUSHES[2].fetch_add(1, Ordering::Relaxed);
                         return;
@@ -8738,6 +9046,8 @@ struct Presenter {
     hwnd: HWND,
     meter: Meter,
     composer: Option<crate::compose::Composer>,
+    /// The swap chain presents PQ/2020 (HDR).
+    hdr: bool,
     #[cfg(feature = "diagnostics")]
     panel: panel::Panel,
 }
@@ -9147,7 +9457,16 @@ impl Host {
                 crate::compose::view(&over_desc)?,
             ))
         });
-        let format = if planes.is_some() {
+        // HDR output: a 10-bit PQ swap chain, always fed through the compose shader (which converts what the title
+        // gave to PQ), so any plane the shader can read can be shown.
+        let hdr_format = crate::hdr::wanted() != crate::hdr::Mode::Off;
+        let format = if hdr_format {
+            if crate::compose::view(&desc).is_none() {
+                tracing::warn!(format = desc.Format.0, "cannot present this format as HDR");
+                return None;
+            }
+            DXGI_FORMAT_R10G10B10A2_UNORM
+        } else if planes.is_some() {
             DXGI_FORMAT_R8G8B8A8_UNORM
         } else {
             let Some(format) = swap_format(desc.Format) else {
@@ -9169,11 +9488,39 @@ impl Host {
         }
         let state_u32 = state;
         let p = presenter.as_mut()?;
-        if planes.is_some() && p.composer.is_none() {
+        // What the compose shader is to do: the planes' colour spaces as the title gave them, and the output's.
+        static NO_SINGLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let spaces = crate::hdr::spaces(frame);
+        crate::hdr::log_space(frame, 0, spaces.0, desc.Format.0);
+        if let Some(pl) = planes.as_ref() {
+            crate::hdr::log_space(frame, 1, spaces.1, pl.3.0);
+        }
+        let pass = crate::compose::Pass {
+            scene: crate::hdr::plane_mode(spaces.0, desc.Format.0),
+            over: planes.as_ref().map_or(0, |pl| crate::hdr::plane_mode(spaces.1, pl.3.0)),
+            has_over: planes.is_some(),
+            out_pq: p.hdr,
+            paper: crate::hdr::paper_nits(),
+            peak: crate::hdr::peak_nits(),
+            stretch: p.hdr && crate::hdr::wanted() == crate::hdr::Mode::Stretch,
+        };
+        // One plane goes through the shader too when the output is PQ or the plane is not plain SDR.
+        let single = planes.is_none() && (p.hdr || pass.scene != 0) && !NO_SINGLE.load(Ordering::Relaxed);
+        if p.hdr && planes.is_none() && NO_SINGLE.load(Ordering::Relaxed) {
+            // The PQ chain cannot take a plain copy of the title's plane (another format): nothing is shown.
+            return None;
+        }
+        let compose_in = match planes {
+            Some((over, over_state, base_fmt, over_fmt)) => Some((Some((over, over_state)), base_fmt, over_fmt)),
+            None if single => crate::compose::view(&desc).map(|f| (None, f, f)),
+            None => None,
+        };
+        if compose_in.is_some() && p.composer.is_none() {
             match crate::compose::Composer::new(self, format) {
                 Ok(c) => p.composer = Some(c),
                 Err(e) => {
-                    tracing::warn!(error = %e, "two-plane composer not made; showing base plane only");
+                    tracing::warn!(error = %e, "composer not made; showing base plane only");
+                    NO_SINGLE.store(true, Ordering::Relaxed);
                     drop(presenter);
                     return self.present_planes(texture, state_u32, None, frame);
                 }
@@ -9208,11 +9555,12 @@ impl Host {
                 }
             }
         }
-        if planes.is_some() && p.composer.is_none() {
+        if compose_in.is_some() && p.composer.is_none() {
             match crate::compose::Composer::new(self, format) {
                 Ok(c) => p.composer = Some(c),
                 Err(e) => {
-                    tracing::warn!(error = %e, "two-plane composer not made after resize; showing base plane only");
+                    tracing::warn!(error = %e, "composer not made after resize; showing base plane only");
+                    NO_SINGLE.store(true, Ordering::Relaxed);
                     drop(presenter);
                     return self.present_planes(texture, state_u32, None, frame);
                 }
@@ -9250,14 +9598,18 @@ impl Host {
             copy.reset();
             copy.keep(texture);
             let list = &copy.list;
-            let composed = if let Some((over, over_state, base_fmt, over_fmt)) = planes {
-                copy.keep(over);
+            let composed = if let Some((over_in, base_fmt, over_fmt)) = compose_in {
+                if let Some((over, _)) = over_in {
+                    copy.keep(over);
+                }
                 if let Some(composer) = p.composer.as_mut() {
                     let mut pre = Vec::with_capacity(3);
                     if state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
                         pre.push(transition(texture, state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
                     }
-                    if over_state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
+                    if let Some((over, over_state)) = over_in
+                        && over_state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+                    {
                         pre.push(transition(over, over_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
                     }
                     pre.push(transition(&back, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET));
@@ -9267,13 +9619,15 @@ impl Host {
                         self,
                         compose_slot,
                         list,
-                        [(texture, base_fmt), (over, over_fmt)],
+                        [(texture, base_fmt), (over_in.map_or(texture, |o| o.0), over_fmt)],
                         &back,
                         (width, height),
+                        pass,
                     ) {
                         copy.close();
                         drop(back);
                         drop(presenter);
+                        NO_SINGLE.store(true, Ordering::Relaxed);
                         tracing::warn!(%err, "could not record display composite; presenting the base plane");
                         return self.present_planes(texture, state_u32, None, frame);
                     }
@@ -9285,14 +9639,18 @@ impl Host {
                             height,
                             base_format = base_fmt.0,
                             overlay_format = over_fmt.0,
-                            "display output: compositing two planes (overlay active)"
+                            has_overlay = over_in.is_some(),
+                            ?pass,
+                            "display output: composing the presented plane(s) through the compose shader"
                         );
                     }
                     let mut post = Vec::with_capacity(3);
                     if state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
                         post.push(transition(texture, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, state));
                     }
-                    if over_state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
+                    if let Some((over, over_state)) = over_in
+                        && over_state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+                    {
                         post.push(transition(over, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, over_state));
                     }
                     post.push(transition(
@@ -9446,7 +9804,9 @@ impl Host {
                 .cast::<IDXGISwapChain3>()?;
             let copy = self.new_list()?;
             copy.close();
-            tracing::info!(width, height, format = format.0, "presenting to a window");
+            let hdr = crate::hdr::wanted() != crate::hdr::Mode::Off && format == DXGI_FORMAT_R10G10B10A2_UNORM && crate::hdr::configure(&swap_chain);
+            crate::hdr::set_active(hdr);
+            tracing::info!(width, height, format = format.0, hdr, "presenting to a window");
             self.log_video_memory("right after the swap chain is made");
             Ok(Presenter {
                 swap_chain,
@@ -9458,6 +9818,7 @@ impl Host {
                 hwnd,
                 meter: Meter::new(),
                 composer: None,
+                hdr,
                 #[cfg(feature = "diagnostics")]
                 panel: panel::Panel::new(),
             })
@@ -9961,15 +10322,27 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
             bottom: height as i32,
         };
         AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false)?;
+        let (mut x, mut y, mut w, mut h) = (CW_USEDEFAULT, CW_USEDEFAULT, rect.right - rect.left, rect.bottom - rect.top);
+        let mut style = WS_OVERLAPPEDWINDOW | WS_VISIBLE;
+        // `VICTORY_MONITOR` / `VICTORY_FULLSCREEN`: on that screen, centred, or filling it.
+        if let Some(t) = crate::hdr::target() {
+            if t.fullscreen {
+                (x, y, w, h) = (t.bounds[0], t.bounds[1], t.bounds[2] - t.bounds[0], t.bounds[3] - t.bounds[1]);
+                style = WS_POPUP | WS_VISIBLE;
+            } else {
+                x = t.work[0] + ((t.work[2] - t.work[0] - w) / 2).max(0);
+                y = t.work[1] + ((t.work[3] - t.work[1] - h) / 2).max(0);
+            }
+        }
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
             CLASS,
             w!("VIctory"),
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            rect.right - rect.left,
-            rect.bottom - rect.top,
+            style,
+            x,
+            y,
+            w,
+            h,
             None,
             None,
             Some(instance.into()),

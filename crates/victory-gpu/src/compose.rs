@@ -11,10 +11,15 @@ use windows::core::{PCSTR, s};
 use crate::host::Host;
 
 const SOURCE: &str = r#"
-#define RS "DescriptorTable(SRV(t0, numDescriptors=2), visibility=SHADER_VISIBILITY_PIXEL), StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR, addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP)"
+#define RS "DescriptorTable(SRV(t0, numDescriptors=2), visibility=SHADER_VISIBILITY_PIXEL), RootConstants(num32BitConstants=8, b0, visibility=SHADER_VISIBILITY_PIXEL), StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR, addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP)"
 Texture2D<float4> scene : register(t0);
 Texture2D<float4> over : register(t1);
 SamplerState smooth_ : register(s0);
+// Modes of a plane: 0 sRGB/709, 1 PQ/2020, 2 linear 709 (1.0 = 80 nits), 3 gamma 2.2/2020.
+cbuffer Params : register(b0) {
+    uint scene_mode; uint over_mode; uint has_over; uint out_pq;
+    float paper; float peak; float stretch; float pad;
+};
 struct V { float4 at : SV_Position; float2 uv : TEXCOORD0; };
 [RootSignature(RS)]
 V vs(uint id : SV_VertexID) {
@@ -23,13 +28,94 @@ V vs(uint id : SV_VertexID) {
     v.at = float4(v.uv * float2(2, -2) + float2(-1, 1), 0, 1);
     return v;
 }
+static const float3x3 M709to2020 = float3x3(0.627404, 0.329283, 0.043313, 0.069097, 0.919540, 0.011362, 0.016391, 0.088013, 0.895595);
+static const float3x3 M2020to709 = float3x3(1.660491, -0.587641, -0.072850, -0.124550, 1.132900, -0.008349, -0.018151, -0.100579, 1.118730);
+float3 srgb_eotf(float3 c) { return (c <= 0.04045) ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4); }
+float3 srgb_oetf(float3 l) { l = saturate(l); return (l <= 0.0031308) ? l * 12.92 : 1.055 * pow(l, 1.0 / 2.4) - 0.055; }
+static const float PQ_M1 = 0.1593017578125;
+static const float PQ_M2 = 78.84375;
+static const float PQ_C1 = 0.8359375;
+static const float PQ_C2 = 18.8515625;
+static const float PQ_C3 = 18.6875;
+float3 pq_to_nits(float3 e) {
+    float3 p = pow(max(e, 0), 1.0 / PQ_M2);
+    return 10000.0 * pow(max(p - PQ_C1, 0) / (PQ_C2 - PQ_C3 * p), 1.0 / PQ_M1);
+}
+float3 nits_to_pq(float3 n) {
+    float3 y = pow(saturate(n / 10000.0), PQ_M1);
+    return pow((PQ_C1 + PQ_C2 * y) / (1.0 + PQ_C3 * y), PQ_M2);
+}
+// A plane's colour as absolute light (nits) in BT.2020.
+float3 to_nits(float3 c, uint mode) {
+    if (mode == 1) return pq_to_nits(c);
+    if (mode == 2) return mul(M709to2020, c * 80.0);
+    float3 lin = (mode == 3) ? pow(max(c, 0), 2.2) : srgb_eotf(c);
+    float3 n = lin * paper;
+    // APPROXIMATION, only with VICTORY_HDR=stretch: SDR highlights are pushed towards the screen's peak.
+    if (stretch > 0.5) {
+        float y = dot(lin, float3(0.2126, 0.7152, 0.0722));
+        n *= 1.0 + max(peak / paper - 1.0, 0.0) * y * y * y;
+    }
+    return (mode == 3) ? n : mul(M709to2020, n);
+}
 [RootSignature(RS)]
 float4 ps(V v) : SV_Target {
     float4 s = scene.SampleLevel(smooth_, v.uv, 0);
     float4 o = over.SampleLevel(smooth_, v.uv, 0);
-    return float4(saturate(o.rgb + s.rgb * (1 - saturate(o.a))), 1);
+    // Two SDR planes: blended as the console's display does (in their own encoding), then shown.
+    if (scene_mode == 0 && (has_over == 0 || over_mode == 0)) {
+        float3 c = has_over != 0 ? saturate(o.rgb + s.rgb * (1 - saturate(o.a))) : s.rgb;
+        if (out_pq == 0) return float4(c, 1);
+        return float4(nits_to_pq(to_nits(c, 0)), 1);
+    }
+    float3 result = to_nits(s.rgb, scene_mode);
+    if (has_over != 0) {
+        float a = saturate(o.a);
+        float3 straight = a > 0 ? o.rgb / a : float3(0, 0, 0);
+        result = to_nits(straight, over_mode) * a + result * (1 - a);
+    }
+    if (out_pq != 0) return float4(nits_to_pq(result), 1);
+    // SDR output of PQ or linear planes (only when the PQ swap chain could not be set).
+    return float4(srgb_oetf(mul(M2020to709, result / paper)), 1);
 }
 "#;
+
+/// How a present's planes are read and written (the shader's `Pass`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Pass {
+    /// Input modes of the base and overlay planes (see [`crate::hdr::plane_mode`]).
+    pub scene: u32,
+    pub over: u32,
+    /// An overlay plane is blended over the base.
+    pub has_over: bool,
+    /// The output is PQ/2020 (HDR); else sRGB.
+    pub out_pq: bool,
+    pub paper: f32,
+    pub peak: f32,
+    /// `VICTORY_HDR=stretch`: the approximate inverse tone map.
+    pub stretch: bool,
+}
+
+impl Pass {
+    /// Two SDR planes to an SDR output: the compositor as it was before HDR.
+    #[allow(dead_code)]
+    pub(crate) fn sdr(has_over: bool) -> Pass {
+        Pass { scene: 0, over: 0, has_over, out_pq: false, paper: 200.0, peak: 1000.0, stretch: false }
+    }
+
+    fn words(&self) -> [u32; 8] {
+        [
+            self.scene,
+            self.over,
+            u32::from(self.has_over),
+            u32::from(self.out_pq),
+            self.paper.to_bits(),
+            self.peak.to_bits(),
+            (if self.stretch { 1.0f32 } else { 0.0 }).to_bits(),
+            0,
+        ]
+    }
+}
 
 pub(crate) struct Composer {
     root: ID3D12RootSignature,
@@ -44,10 +130,11 @@ unsafe impl Sync for Composer {}
 
 fn compile(entry: PCSTR, target: PCSTR) -> windows::core::Result<ID3DBlob> {
     let mut code: Option<ID3DBlob> = None;
+    let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; the out pointer is
     // ours.
     unsafe {
-        D3DCompile(
+        let result = D3DCompile(
             SOURCE.as_ptr().cast(),
             SOURCE.len(),
             s!("compose"),
@@ -58,8 +145,13 @@ fn compile(entry: PCSTR, target: PCSTR) -> windows::core::Result<ID3DBlob> {
             0,
             0,
             &mut code,
-            None,
-        )?;
+            Some(&mut errors),
+        );
+        if let (Err(_), Some(errors)) = (&result, &errors) {
+            let text = std::slice::from_raw_parts(errors.GetBufferPointer().cast::<u8>(), errors.GetBufferSize());
+            tracing::warn!(message = %String::from_utf8_lossy(text), "the compose shader did not compile");
+        }
+        result?;
     }
     code.ok_or_else(windows::core::Error::empty)
 }
@@ -124,6 +216,7 @@ impl Composer {
         planes: [(&ID3D12Resource, DXGI_FORMAT); 2],
         back: &ID3D12Resource,
         (width, height): (u32, u32),
+        pass: Pass,
     ) -> windows::core::Result<()> {
     let _p = victory_core::prof_scope!("compose.record");
         while self.views.len() <= slot {
@@ -170,6 +263,8 @@ impl Composer {
             list.SetGraphicsRootSignature(&self.root);
             list.SetPipelineState(&self.pso);
             list.SetGraphicsRootDescriptorTable(0, gpu);
+            let words = pass.words();
+            list.SetGraphicsRoot32BitConstants(1, 8, words.as_ptr().cast(), 0);
             list.IASetPrimitiveTopology(
                 windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
             );
@@ -294,6 +389,7 @@ mod tests {
                     [(&base, format), (&overlay, format)],
                     &output,
                     (3, 1),
+                    Pass::sdr(true),
                 )
                 .unwrap();
             cmds.ResourceBarrier(&[crate::host::transition(

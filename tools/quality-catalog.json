@@ -7,6 +7,7 @@
  ],
  "groups": [
   "Resolution & profile",
+  "Display & HDR",
   "Lighting & ray tracing",
   "Textures & memory",
   "Performance",
@@ -130,6 +131,87 @@
    "needs_hooks": true,
    "help": "Game-side: forces the game's own temporal upscaler on (the console profile Series S needs it at any scale below 1).",
    "cost": "Small cost, hides the lower render scale"
+  },
+  {
+   "key": "monitor",
+   "env": "VICTORY_MONITOR",
+   "group": "Display & HDR",
+   "kind": "text",
+   "words": [],
+   "min": 0,
+   "max": 0,
+   "presets": [
+    "",
+    "",
+    "",
+    ""
+   ],
+   "live": false,
+   "needs_hooks": false,
+   "help": "Which screen the game's window opens on: part of the monitor's name (Alienware), DISPLAY1, #index (0 is the first output) or primary. Empty: the primary screen. The log lists every screen at start.",
+   "cost": "None"
+  },
+  {
+   "key": "fullscreen",
+   "env": "VICTORY_FULLSCREEN",
+   "group": "Display & HDR",
+   "kind": "bool",
+   "words": [],
+   "min": 0,
+   "max": 0,
+   "presets": [
+    "",
+    "",
+    "",
+    ""
+   ],
+   "live": false,
+   "needs_hooks": false,
+   "help": "A borderless window the size of the chosen screen instead of a small window (the picture is stretched to it).",
+   "cost": "A bigger window costs a little GPU time"
+  },
+  {
+   "key": "hdr",
+   "env": "VICTORY_HDR",
+   "group": "Display & HDR",
+   "kind": "choice",
+   "words": [
+    "auto",
+    "on",
+    "off",
+    "stretch"
+   ],
+   "min": 0,
+   "max": 0,
+   "presets": [
+    "auto",
+    "auto",
+    "auto",
+    "auto"
+   ],
+   "live": false,
+   "needs_hooks": false,
+   "help": "auto: HDR output when Windows HDR is on for the chosen screen (turn on Use HDR for it in Windows Settings; VIctory never changes that). on: always tell the game HDR is available and present PQ/BT.2020. off: SDR. stretch: APPROXIMATION, the game stays SDR and its picture is expanded to HDR.",
+   "cost": "None"
+  },
+  {
+   "key": "hdr_paper_nits",
+   "env": "VICTORY_HDR_PAPER_NITS",
+   "group": "Display & HDR",
+   "kind": "num",
+   "words": [],
+   "min": 80.0,
+   "max": 500.0,
+   "presets": [
+    "",
+    "",
+    "",
+    ""
+   ],
+   "live": false,
+   "needs_hooks": false,
+   "help": "HDR only: the brightness in nits of SDR white (the interface, menus and the numbers panel; default 200). The game's own HDR picture is not changed by it.",
+   "cost": "None"
   },
   {
    "key": "ray_miss",

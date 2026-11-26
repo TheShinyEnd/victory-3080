@@ -2551,7 +2551,7 @@ impl State {
         let per_frame = match asked {
             Some(mb) => mb << 20,
             None => {
-                let base = if crate::residency::legacy() {
+                let base = if !crate::residency::part(crate::residency::Part::Uploads) {
                     staging_budget_per_frame(memory.map(|[budget, ..]| budget))
                 } else {
                     crate::residency::upload_budget(memory.map(|[budget, ..]| budget), false).0
@@ -2675,7 +2675,7 @@ impl State {
         static SPAN_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         let span = std::time::Duration::from_millis(*SPAN_MS.get_or_init(|| {
             std::env::var("VICTORY_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or_else(|| {
-                if crate::residency::legacy() { 250 } else { crate::residency::upload_budget(None, false).1 }
+                if !crate::residency::part(crate::residency::Part::Uploads) { 250 } else { crate::residency::upload_budget(None, false).1 }
             })
         }));
         // A backlog (a scene's first minutes: 22,000 slots due, 2-3 minutes of black
@@ -2683,7 +2683,7 @@ impl State {
         // drains; `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget.
         static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let catchup = *CATCHUP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
-        let more = if crate::residency::legacy() { 3 } else { 2 };
+        let more = if !crate::residency::part(crate::residency::Part::Uploads) { 3 } else { 2 };
         let (per_frame, span) = if catchup && on_time >= 1024 { (per_frame * more, span * more as u32) } else { (per_frame, span) };
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
@@ -2713,10 +2713,35 @@ impl State {
             BAKE_SERVED.store(0, Ordering::Relaxed);
         }
         let mut served = true;
+        // Lookups (no mip chain, small) and slots that already have their
+        // host copy (the title rewrote them) are not deferred by the frame's
+        // upload budget, within 96 MB a pass: a stale or late dither, colour
+        // table or history shows as banding over the whole picture.
+        let protect = crate::residency::part(crate::residency::Part::Protect) && !required && sync.is_none();
+        let mut over_taken = 0u64;
+        let mut skipped = 0u32;
         for (index, write) in due {
+            let mut exempt_now = false;
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
                 served = false;
-                break;
+                if protect && over_taken < (96 << 20) && skipped < 512 && began.elapsed() < span * 3 {
+                    let rewritten = heap.handle(index).is_some_and(|handle| host.texture_slot_made_from(index, handle));
+                    exempt_now = rewritten
+                        || matches!(
+                            heap.handle(index).and_then(crate::descriptor::view),
+                            Some(View::Placed(false, resource, _)) if {
+                                let (w, h, mips, _) = crate::resource::describe_placed(&resource);
+                                crate::residency::is_lookup(w, h, mips)
+                            }
+                        );
+                }
+                if !exempt_now {
+                    if protect && skipped < 512 {
+                        skipped += 1;
+                        continue;
+                    }
+                    break;
+                }
             }
             // A placed texture whose memory is not mapped (not streamed in
             // yet, or streamed out again: the heap keeps tens of thousands
@@ -2840,16 +2865,23 @@ impl State {
                 // The residency policy lets small textures (and, for a
                 // decoration bake, anything that fits under the hard line)
                 // past the line instead of leaving their slots null.
-                let admitted = !has_its_texture && !crate::residency::legacy() && {
-                    if required {
+                let lookup = crate::residency::part(crate::residency::Part::Protect)
+                    && shape.bytes > 0
+                    && crate::residency::is_lookup(shape.width, shape.height, shape.mips);
+                let admitted = !has_its_texture && {
+                    if required && !crate::residency::legacy() {
                         crate::resource::admit_bake(memory, shape.bytes, uploaded_here)
+                    } else if lookup {
+                        crate::resource::admit_lookup(memory, shape.bytes, uploaded_here)
+                    } else if !crate::residency::part(crate::residency::Part::Line) {
+                        false
                     } else {
                         crate::resource::admit_copy(memory, shape.bytes, uploaded_here) != crate::residency::Admit::No
                     }
                 };
                 if !has_its_texture && !admitted {
                     refused += 1;
-                    if !crate::residency::legacy() && shape.bytes > 0 {
+                    if shape.bytes > 0 {
                         crate::residency::note_refused(shape, crate::residency::Why::Budget);
                     }
                     if full_card_pass() {
@@ -2857,7 +2889,7 @@ impl State {
                         // (`most`), or until the card has room; the pass
                         // goes on, within a count that bounds one pass.
                         // (The policy: a second at most.)
-                        let hold = if crate::residency::legacy() { most } else { (most / 16).clamp(4, 64) };
+                        let hold = if !crate::residency::part(crate::residency::Part::Uploads) { most } else { (most / 16).clamp(4, 64) };
                         host.texture_slot_held(index, write, frame + hold);
                         if refused > 1024 {
                             break;
@@ -2880,7 +2912,7 @@ impl State {
             // `mapped == 0` reclamation (`texture_slot_gone`) has run, and
             // before mirroring a slot to an unuploaded texture.
             if !crate::residency::admit_texture_pass(required) {
-                if !crate::residency::legacy() && shape.bytes > 0 {
+                if shape.bytes > 0 {
                     crate::residency::note_refused(shape, crate::residency::Why::Commit);
                 }
                 served = false;
@@ -3098,6 +3130,9 @@ impl State {
             crate::texture::unstage(resource);
             SPENT.fetch_add(bytes, Ordering::Relaxed);
             uploaded_here += bytes;
+            if exempt_now {
+                over_taken += bytes;
+            }
             crate::residency::note_resident(index);
             since_asked += bytes;
             if room && since_asked >= 32 << 20 {

@@ -66,6 +66,23 @@ function Format-Quality([string]$Preset, $Options) {
     return $sb.ToString()
 }
 
+# The screens this PC has, as values for `monitor`: primary, DISPLAYn (Windows' name of the output) and each monitor's own
+# model name (the runtime matches a part of it). The runtime's log lists the same at start.
+function Get-MonitorChoices {
+    $items = @('primary')
+    try {
+        Add-Type -AssemblyName System.Windows.Forms
+        foreach ($s in [System.Windows.Forms.Screen]::AllScreens) { $items += $s.DeviceName.Replace('\.\', '') }
+    } catch { }
+    try {
+        foreach ($m in (Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorID -ErrorAction Stop)) {
+            $n = -join ($m.UserFriendlyName | Where-Object { $_ -ne 0 } | ForEach-Object { [char]$_ })
+            if ($n) { $items += $n }
+        }
+    } catch { }
+    return @($items | Select-Object -Unique)
+}
+
 # What the user typed in an option's box, checked against its kind; returns an error text or $null.
 function Test-Value($o, [string]$v) {
     $v = $v.Trim()
@@ -188,6 +205,7 @@ foreach ($g in $catalog.groups) {
             default {
                 [void]$box.Items.Add('default')
                 foreach ($p in ($o.presets | Where-Object { $_ -ne '' } | Select-Object -Unique)) { [void]$box.Items.Add($p) }
+                if ($o.key -eq 'monitor') { foreach ($m in (Get-MonitorChoices)) { [void]$box.Items.Add($m) } }
                 $box.DropDownStyle = 'DropDown'
             }
         }

@@ -1711,7 +1711,7 @@ fn texture_floor_bytes(vram_budget: Option<u64>) -> u64 {
 pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
     const WITHOUT_BUDGET: u64 = 4 << 30;
-    if !crate::residency::legacy() {
+    if crate::residency::part(crate::residency::Part::Line) {
         return admit_copy(memory, 0, 0) != crate::residency::Admit::No;
     }
     static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
@@ -1759,7 +1759,7 @@ pub(crate) fn admit_copy(memory: Option<[u64; 4]>, bytes: u64, used_since: u64) 
     use crate::residency::Admit;
     use std::sync::atomic::Ordering::Relaxed;
     const WITHOUT_BUDGET: u64 = 4 << 30;
-    if crate::residency::legacy() {
+    if !crate::residency::part(crate::residency::Part::Line) {
         return if room(memory) { Admit::Yes } else { Admit::No };
     }
     static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
@@ -1783,6 +1783,18 @@ pub(crate) fn admit_copy(memory: Option<[u64; 4]>, bytes: u64, used_since: u64) 
         }
         _ if filled < WITHOUT_BUDGET => Admit::Yes,
         _ => Admit::No,
+    }
+}
+
+/// Whether a lookup texture (`residency::is_lookup`) may be given a host
+/// copy of `bytes` bytes: while the card stays under its budget.
+#[cfg(windows)]
+pub(crate) fn admit_lookup(memory: Option<[u64; 4]>, bytes: u64, used_since: u64) -> bool {
+    match memory {
+        Some([budget, used, ..]) if budget > 0 => {
+            crate::residency::policy(budget).admit_lookup(counted_use(used).saturating_add(used_since), bytes)
+        }
+        _ => true,
     }
 }
 
@@ -2143,8 +2155,11 @@ pub(crate) fn let_go_idle() {
     // Frames a copy must be unused too (the policy's: more than the base's
     // four, so that what a few slow frames did not sample stays).
     let mut frames = IDLE_FRAMES;
+    // Lookups (noise, tables) stay while the policy sweeps.
+    let protect = crate::residency::part(crate::residency::Part::Evict) && crate::residency::part(crate::residency::Part::Protect);
+    let kept = |d: &ResourceDesc| protect && crate::residency::is_lookup(d.width, d.height, u32::from(d.mip_levels));
     let (idle_ms, most) = match memory {
-        Some([budget, used, ..]) if budget > 0 && !crate::residency::legacy() => {
+        Some([budget, used, ..]) if budget > 0 && crate::residency::part(crate::residency::Part::Evict) => {
             let (ms, idle_frames, most) = crate::residency::eviction(budget, counted_use(used));
             frames = idle_frames;
             (ms, most)
@@ -2168,7 +2183,7 @@ pub(crate) fn let_go_idle() {
             // SAFETY: as below.
             let r = unsafe { &*(at as *const Resource) };
             let used = r.host.used.load(Relaxed);
-            if used != 0 && fills(&r.desc) && crate::host::long_ago(used, idle_ms, frames) {
+            if used != 0 && fills(&r.desc) && !kept(&r.desc) && crate::host::long_ago(used, idle_ms, frames) {
                 by_age.push((used & 0xffff_ffff, at));
             }
         }
@@ -2204,7 +2219,7 @@ pub(crate) fn let_go_idle() {
         let r = unsafe { &*(at as *const Resource) };
         // (Without its lock first: most were used lately or have none.)
         let used = r.host.used.load(Relaxed);
-        if used == 0 || !fills(&r.desc) || !crate::host::long_ago(used, idle_ms, frames) || crate::texture::host_wrote(at) {
+        if used == 0 || !fills(&r.desc) || kept(&r.desc) || !crate::host::long_ago(used, idle_ms, frames) || crate::texture::host_wrote(at) {
             continue;
         }
         let gone = {

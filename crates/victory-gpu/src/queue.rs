@@ -666,6 +666,18 @@ struct RetailPlane {
 #[cfg(windows)]
 const _: () = assert!(size_of::<RetailPlane>() == 72);
 
+/// The colour space (`DXGI_COLOR_SPACE_TYPE`) the title gave plane `index` of a present, if the memory reads.
+#[cfg(windows)]
+fn plane_space(parameters: *const Plane, index: usize) -> Option<u32> {
+    let at = parameters
+        .cast::<RetailPlane>()
+        .wrapping_add(index)
+        .cast::<u8>()
+        .wrapping_add(std::mem::offset_of!(RetailPlane, color_space));
+    let mut bytes = [0; 4];
+    crate::host::read_into(at, &mut bytes).then(|| u32::from_ne_bytes(bytes))
+}
+
 #[cfg(windows)]
 fn overlay_resource(parameters: *const Plane) -> Option<This> {
     // Read only the second prefix at the 72-byte retail PresentX stride. A
@@ -926,6 +938,13 @@ extern "system" fn present(
         release_held(forces());
     }
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    // The colour spaces the title gave the planes: the compose shader needs them (`hdr`).
+    #[cfg(windows)]
+    if planes > 0 && !plane_parameters.is_null() {
+        let base = plane_space(plane_parameters, 0).unwrap_or(u32::MAX);
+        let over = if planes > 1 { plane_space(plane_parameters, 1).unwrap_or(u32::MAX) } else { u32::MAX };
+        crate::hdr::note_spaces(frame, base, over);
+    }
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]

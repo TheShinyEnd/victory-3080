@@ -115,7 +115,44 @@ pub(crate) mod stat {
     pub(crate) const HAD_BYTES: usize = 24;
     /// Jobs.
     pub(crate) const JOBS: usize = 25;
-    pub(crate) const COUNT: usize = 26;
+    /// Bytes asked for because the card's hash flagged the piece; because
+    /// the piece was never hashed (fetched whole, unconditionally).
+    pub(crate) const FETCH_FLAGGED: usize = 26;
+    pub(crate) const FETCH_UNCOMPARED: usize = 27;
+    /// Fetches cut in chunks (`VICTORY_FETCH_CHUNKS`): landings, chunks, and
+    /// microseconds this thread was blocked waiting for a chunk.
+    pub(crate) const CHUNKED: usize = 28;
+    pub(crate) const CHUNKS: usize = 29;
+    pub(crate) const CHUNK_WAIT: usize = 30;
+    /// Bytes of fetch buffers given back (`VICTORY_FETCH_TRIM`).
+    pub(crate) const TRIMMED: usize = 31;
+    pub(crate) const COUNT: usize = 32;
+}
+
+/// How many pieces of a fetch to cut it in (`VICTORY_FETCH_CHUNKS`, 4; 1: one
+/// fetch and one wait, as before). The card brings the chunks one after the
+/// other on its copy queue, each signalled when it is there, and the merge of
+/// one runs while the next is on its way. The bytes, the merges and what is
+/// left out are the same; only what is waited for when changes.
+pub(crate) fn chunks_wanted() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_FETCH_CHUNKS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4usize).clamp(1, 16))
+}
+
+/// The chunks a fetch of `total` bytes is cut in (not below
+/// `VICTORY_FETCH_CHUNK_MIN_MB`, 4: smaller ones are one wait anyway).
+pub(crate) fn chunks(total: u64) -> usize {
+    static MIN: OnceLock<u64> = OnceLock::new();
+    let min = *MIN.get_or_init(|| std::env::var("VICTORY_FETCH_CHUNK_MIN_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4u64));
+    if total >= min << 20 { chunks_wanted() } else { 1 }
+}
+
+/// Whether a fetch buffer that has been four times too big for 120 landings
+/// in a row (and over 128 MB) is made again at the size needed
+/// (`VICTORY_FETCH_TRIM=0`: it only ever grows, as before).
+pub(crate) fn trim_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FETCH_TRIM").is_none_or(|v| v != "0"))
 }
 
 static STATS: [AtomicU64; stat::COUNT] = [const { AtomicU64::new(0) }; stat::COUNT];
@@ -171,6 +208,24 @@ pub(crate) fn log(frames: f64) {
         ms(stat::READ_BACKS),
         ms(stat::TOLD),
         ms(stat::REST),
+    );
+    tracing::info!(
+        "fetched per frame by reason: {:.1} MB because the card's hash flagged the piece, {:.1} MB never hashed (fetched whole); \
+         skipped because an earlier fetch held the piece: {:.1} MB (VICTORY_LAND_SKIP={}); merging {:.2} ms of the landing; \
+         {:.2} landings fetched in {:.1} chunks (VICTORY_FETCH_CHUNKS={}), the relay's thread blocked {:.2} ms waiting for \
+         the card to bring them (the rest of the fetch ran beside merging); {:.1} MB of fetch buffers given back \
+         (VICTORY_FETCH_TRIM={})",
+        mb(s[stat::FETCH_FLAGGED]),
+        mb(s[stat::FETCH_UNCOMPARED]),
+        mb(s[stat::HAD_BYTES]),
+        u8::from(skip_on()),
+        ms(stat::CARD),
+        s[stat::CHUNKED],
+        s[stat::CHUNKS],
+        chunks_wanted(),
+        ms(stat::CHUNK_WAIT),
+        mb(s[stat::TRIMMED]),
+        u8::from(trim_on()),
     );
     tracing::info!(
         "landed per frame: {:.0} pieces, {:.0} with a new byte; of their {:.0} pages of 4 KiB {:.0} with a new byte ({:.1} MB), \

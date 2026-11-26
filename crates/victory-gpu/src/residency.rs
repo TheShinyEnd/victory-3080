@@ -191,8 +191,53 @@ pub(crate) fn prefetch_limit(bytes: u64, pressure: bool, critical: bool, limited
 pub(crate) fn legacy() -> bool {
     static LEGACY: OnceLock<bool> = OnceLock::new();
     *LEGACY.get_or_init(|| {
-        matches!(std::env::var("VICTORY_RESIDENCY").as_deref().map(str::trim), Ok("legacy" | "base" | "off" | "0"))
+        // The base's rules unless the card policy is asked for by name
+        // (`VICTORY_RESIDENCY=auto`): on a 10 GB card it left tens of
+        // thousands of textures null and banded the picture (2026-11-26).
+        !matches!(std::env::var("VICTORY_RESIDENCY").as_deref().map(str::trim), Ok("auto" | "card" | "on" | "1"))
     })
+}
+
+/// The parts of the policy, each with a switch of its own to A/B them:
+/// `VICTORY_RESIDENCY_<PART>=legacy` (or `0`) gives that part the base's rule
+/// while the others stay. `VICTORY_RESIDENCY=legacy` turns all of them off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Part {
+    /// LINE: the admission line, floor and small-texture rule.
+    Line,
+    /// UPLOADS: the per-frame upload bytes/ms, backlog factor and retry time.
+    Uploads,
+    /// EVICT: the sweep that lets go of idle host copies.
+    Evict,
+    /// PROTECT: lookups (no mip chain, small, data) are exempt: not deferred
+    /// by the frame's upload budget, not evicted, admitted up to the budget.
+    Protect,
+}
+
+pub(crate) fn part(part: Part) -> bool {
+    static ON: OnceLock<[bool; 4]> = OnceLock::new();
+    let on = ON.get_or_init(|| {
+        let all = !legacy();
+        let sub = |name: &str| {
+            all && !matches!(std::env::var(name).as_deref().map(str::trim), Ok("legacy" | "base" | "off" | "0"))
+        };
+        [
+            sub("VICTORY_RESIDENCY_LINE"),
+            sub("VICTORY_RESIDENCY_UPLOADS"),
+            sub("VICTORY_RESIDENCY_EVICT"),
+            sub("VICTORY_RESIDENCY_PROTECT"),
+        ]
+    });
+    on[part as usize]
+}
+
+/// A texture the picture reads as a table or noise (no mip chain, or at most
+/// 512 x 512 texels): the title rewrites or looks up these (dither, colour
+/// grading, exposure, history); a late, stale, evicted or null one shows as
+/// banding or flicker over the whole frame. They are never deferred by the
+/// upload budget, never evicted, never reduced, and admitted up to the budget.
+pub(crate) fn is_lookup(width: u64, height: u32, mips: u32) -> bool {
+    mips <= 1 || width.saturating_mul(u64::from(height)) <= 512 * 512
 }
 
 fn env_u64(name: &str) -> Option<u64> {
@@ -258,6 +303,12 @@ impl Policy {
         } else {
             Admit::No
         }
+    }
+
+    /// A lookup texture ([`is_lookup`]) or one a bake samples: anything that
+    /// stays under the budget itself (less 1/128 of it).
+    pub(crate) fn admit_lookup(&self, used: u64, bytes: u64) -> bool {
+        used.saturating_add(bytes) <= self.budget - self.budget / 128
     }
 
     /// Eviction switches on at `evict_hi` (or when admissions starve) and
@@ -499,6 +550,13 @@ pub(crate) fn report(memory: Option<[u64; 4]>) {
     {
         let p = policy(budget_bytes);
         let (stage, span) = upload_budget(Some(budget_bytes), false);
+        tracing::info!(
+            "residency: parts on (VICTORY_RESIDENCY_<PART>=legacy turns one off): line={} uploads={} evict={} protect={}",
+            part(Part::Line),
+            part(Part::Uploads),
+            part(Part::Evict),
+            part(Part::Protect)
+        );
         let cap = mip_cap_bytes();
         tracing::info!(
             "residency: mode={} budget {} MB -> admit line {} MB, hard line {} MB, evict {}..{} MB after {} idle frames, floor {} MB, small {} MB, per frame {} MB / {} ms, mip cap {}",
@@ -623,6 +681,16 @@ mod tests {
         assert_eq!(cap_base(size, 0, 3, 1), 2);
         assert_eq!(cap_for_budget(24 * GIB), u64::MAX);
         assert_eq!(cap_for_budget(2 * GIB), 8 * MIB);
+    }
+
+    #[test]
+    fn lookups_are_recognised_and_admitted_up_to_the_budget() {
+        assert!(is_lookup(2048, 2048, 1));
+        assert!(is_lookup(512, 512, 9));
+        assert!(!is_lookup(1024, 1024, 11));
+        let p = Policy::derive(BUDGET, None, None, None);
+        assert!(p.admit_lookup(p.hard_line, 16 * MIB));
+        assert!(!p.admit_lookup(BUDGET, MIB));
     }
 
     #[test]

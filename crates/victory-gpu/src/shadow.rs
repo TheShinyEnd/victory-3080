@@ -102,6 +102,9 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// The submission each kind of refresh question last came in (profile:
+    /// repeats within a submission): the check, the update.
+    seen: [AtomicU64; 2],
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -2994,6 +2997,7 @@ impl Shadow {
             changes_only: Default::default(),
             mapped: false,
             place: None,
+            seen: Default::default(),
         }
     }
 
@@ -3696,6 +3700,9 @@ impl Shadow {
         if from >= to {
             return 0;
         }
+        if self.seen[1].swap(PREPARED.load(Ordering::Relaxed), Ordering::Relaxed) == PREPARED.load(Ordering::Relaxed) {
+            victory_core::prof_count!("refresh.update.repeat_in_submission", 1);
+        }
         let mut busy: Vec<(usize, usize)> = self
             .pending
             .lock()
@@ -3728,23 +3735,39 @@ impl Shadow {
     /// nothing, and knows it without asking anything
     /// (`crate::watch::nothing_new`). `false` if it would have to ask.
     pub(crate) fn nothing_new(&self, address: usize, len: usize) -> bool {
+        let _p = victory_core::prof_scope!("refresh.nothing_new");
+        if self.seen[0].swap(PREPARED.load(Ordering::Relaxed), Ordering::Relaxed) == PREPARED.load(Ordering::Relaxed) {
+            victory_core::prof_count!("refresh.nn.repeat_in_submission", 1);
+        }
         if self.place.is_some() {
+            victory_core::prof_count!("refresh.nn.in_place", 1);
             return true;
         }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
+            victory_core::prof_count!("refresh.nn.empty", 1);
             return true;
         }
         if !matches!(self.watched.load(Ordering::Relaxed), 1 | GUARDED) {
+            victory_core::prof_count!("refresh.nn.no.unwatched", 1);
             return false;
         }
         // Around ranges shaders are writing the refresh asks gap by gap.
         if self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from) {
+            victory_core::prof_count!("refresh.nn.no.pending", 1);
             return false;
         }
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let same = crate::watch::nothing_new(from, to, start / PAGE, &copied, self.ranged(from, to));
+        let why = crate::watch::nothing_new_why(from, to, start / PAGE, &copied, self.ranged(from, to));
+        match why {
+            0 => victory_core::prof_count!("refresh.nn.yes", (to - from) >> 10),
+            1 => victory_core::prof_count!("refresh.nn.no.not_asked", (to - from) >> 10),
+            2 => victory_core::prof_count!("refresh.nn.no.notes_short", 1),
+            3 => victory_core::prof_count!("refresh.nn.no.never_taken", (to - from) >> 10),
+            _ => victory_core::prof_count!("refresh.nn.no.written", (to - from) >> 10),
+        }
+        let same = why == 0;
         #[cfg(feature = "diagnostics")]
         if same {
             use crate::copystat::{C, add};
@@ -3765,11 +3788,24 @@ impl Shadow {
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
+            let asked = {
+                let _p = victory_core::prof_scope!("refresh.writes");
+                crate::watch::writes(from, to, true)
+            };
+            if let Some((now, written)) = asked {
+                victory_core::prof_count!("refresh.writes.pages", written.len());
                 // (A range whose blocks rest after a write has no guard now.)
                 let guarded = crate::watch::guarded(from, to) || self.watched.load(Ordering::Relaxed) == GUARDED;
                 self.watched.store(if guarded { GUARDED } else { 1 }, Ordering::Relaxed);
-                let copied = self.copy_stale(from, to, now, &written);
+                let copied = {
+                    let _p = victory_core::prof_scope!("refresh.copy_stale");
+                    self.copy_stale(from, to, now, &written)
+                };
+                if copied == 0 {
+                    victory_core::prof_count!("refresh.update.copied0", (to - from) >> 10);
+                } else {
+                    victory_core::prof_count!("refresh.update.copied", copied >> 10);
+                }
                 self.refresh_check(from, to);
                 #[cfg(feature = "diagnostics")]
                 {
@@ -3781,6 +3817,7 @@ impl Shadow {
             }
             self.watched.store(NOT_WATCHED, Ordering::Relaxed);
         }
+        victory_core::prof_count!("refresh.update.whole", (to - from) >> 10);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::WholeBytes, (to - from) as u64);
         #[cfg(feature = "diagnostics")]

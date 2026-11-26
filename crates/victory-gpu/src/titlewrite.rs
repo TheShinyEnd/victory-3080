@@ -67,7 +67,7 @@ fn copies_on() -> bool {
     if ON_IN_TEST.get() {
         return true;
     }
-    asked_for!("VICTORY_COPY_BESIDE")
+    asked_for!("VICTORY_COPY_BESIDE") || both_in_phase()
 }
 
 fn stores_on() -> bool {
@@ -75,7 +75,21 @@ fn stores_on() -> bool {
     if ON_IN_TEST.get() {
         return true;
     }
-    asked_for!("VICTORY_STORE_BESIDE")
+    asked_for!("VICTORY_STORE_BESIDE") || both_in_phase()
+}
+
+/// `VICTORY_BESIDE` named in `VICTORY_AB`: both kinds of writes beside the
+/// guards are on in the phases it is on in (diagnostics: measuring both in
+/// one run).
+fn both_in_phase() -> bool {
+    #[cfg(feature = "diagnostics")]
+    {
+        crate::ab::pick("VICTORY_BESIDE").unwrap_or(false)
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -100,7 +114,7 @@ pub fn import(name: &str, address: usize) -> usize {
         _ => return address,
     };
     #[cfg(feature = "diagnostics")]
-    let on = crate::ab::bit("VICTORY_COPY_BESIDE").is_some() || copies_on();
+    let on = crate::ab::bit("VICTORY_COPY_BESIDE").is_some() || crate::ab::bit("VICTORY_BESIDE").is_some() || copies_on();
     #[cfg(not(feature = "diagnostics"))]
     let on = copies_on();
     if !on {

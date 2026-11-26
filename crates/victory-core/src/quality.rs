@@ -68,7 +68,7 @@ macro_rules! opt {
     };
 }
 
-pub const GROUPS: [&str; 5] = ["Resolution & profile", "Lighting & ray tracing", "Textures & memory", "Performance", "Advanced / diagnostics"];
+pub const GROUPS: [&str; 6] = ["Resolution & profile", "Display & HDR", "Lighting & ray tracing", "Textures & memory", "Performance", "Advanced / diagnostics"];
 
 /// Every option. The order is the order of the menu.
 pub static OPTIONS: &[Opt] = &[
@@ -103,6 +103,20 @@ pub static OPTIONS: &[Opt] = &[
             "Game-side: forces the game's own temporal upscaler on (the console profile Series S needs it at any scale below 1).",
             "Small cost, hides the lower render scale")
     },
+    // --- Display & HDR
+    opt!("monitor", "VICTORY_MONITOR", "Display & HDR", Kind::Text, ["", "", "", ""],
+        "Which screen the game's window opens on: part of the monitor's name (Alienware), DISPLAY1, #index (0 is the first output) or primary. Empty: the primary screen. The log lists every screen at start.",
+        "None"),
+    opt!("fullscreen", "VICTORY_FULLSCREEN", "Display & HDR", ON1, ["", "", "", ""],
+        "A borderless window the size of the chosen screen instead of a small window (the picture is stretched to it).",
+        "A bigger window costs a little GPU time"),
+    opt!("hdr", "VICTORY_HDR", "Display & HDR",
+        Kind::Choice(&[("auto", ""), ("on", "on"), ("off", "off"), ("stretch", "stretch")]), ["auto", "auto", "auto", "auto"],
+        "auto: HDR output when Windows HDR is on for the chosen screen (turn on Use HDR for it in Windows Settings; VIctory never changes that). on: always tell the game HDR is available and present PQ/BT.2020. off: SDR. stretch: APPROXIMATION, the game stays SDR and its picture is expanded to HDR.",
+        "None"),
+    opt!("hdr_paper_nits", "VICTORY_HDR_PAPER_NITS", "Display & HDR", Kind::Num { min: 80.0, max: 500.0 }, ["", "", "", ""],
+        "HDR only: the brightness in nits of SDR white (the interface, menus and the numbers panel; default 200). The game's own HDR picture is not changed by it.",
+        "None"),
     // --- Lighting & ray tracing
     opt!("ray_miss", "VICTORY_BVH_MISS", "Lighting & ray tracing", ON1, ["1", "1", "1", "1"],
         "Rays end at the root (miss) while the structure builder is off. Off: the title's ray walks run and may hang on stale structures.",

@@ -111,6 +111,7 @@ pub extern "system" fn CreateWindowExW(
     param: *const c_void,
 ) -> HWND {
     let (x, y, width, height) = fit(parent, x, y, width, height);
+    let style = screen_style(parent, style);
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExW(
@@ -137,6 +138,7 @@ pub extern "system" fn CreateWindowExA(
     param: *const c_void,
 ) -> HWND {
     let (x, y, width, height) = fit(parent, x, y, width, height);
+    let style = screen_style(parent, style);
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExA(
@@ -154,6 +156,24 @@ pub extern "system" fn CreateWindowExA(
 /// chain stretches). `VICTORY_WINDOW_MAX=WIDTHxHEIGHT` applies a smaller
 /// limit without changing the title's render targets.
 fn fit(parent: HWND, x: i32, y: i32, width: i32, height: i32) -> (i32, i32, i32, i32) {
+    // `VICTORY_MONITOR` / `VICTORY_FULLSCREEN`: the window goes on that screen, centred in its work area (shrunk to
+    // `VICTORY_WINDOW_MAX` and the area as below), or filling the screen.
+    if parent.is_null()
+        && let Some(t) = victory_gpu::hdr::target()
+    {
+        if t.fullscreen {
+            let (l, tp) = (t.bounds[0], t.bounds[1]);
+            tracing::info!(bounds = ?t.bounds, "title window placed fullscreen (borderless) on the chosen monitor");
+            return (l, tp, t.bounds[2] - l, t.bounds[3] - tp);
+        }
+        let area = RECT { left: t.work[0], top: t.work[1], right: t.work[2], bottom: t.work[3] };
+        let (w, h) = if width <= 0 || height <= 0 { (1280, 720) } else { (width, height) };
+        let (w, h) = fit_with_limit(&area, w, h, window_limit());
+        let left = area.left + (area.right - area.left - w) / 2;
+        let top = area.top + (area.bottom - area.top - h) / 2;
+        tracing::info!(width, height, to = ?(w, h), at = ?(left, top), "title window placed on the chosen monitor");
+        return (left, top, w, h);
+    }
     let mut area = RECT::default();
     // SAFETY: `area` receives the primary monitor's work area.
     let known =
@@ -168,6 +188,15 @@ fn fit(parent: HWND, x: i32, y: i32, width: i32, height: i32) -> (i32, i32, i32,
     let left = area.left + (area.right - area.left - w) / 2;
     let top = area.top + (area.bottom - area.top - h) / 2;
     (left, top, w, h)
+}
+
+/// The title's window style, made a borderless popup when the window fills a chosen screen.
+fn screen_style(parent: HWND, style: u32) -> u32 {
+    if parent.is_null() && victory_gpu::hdr::target().is_some_and(|t| t.fullscreen) {
+        (style & !wm::WS_OVERLAPPEDWINDOW) | wm::WS_POPUP
+    } else {
+        style
+    }
 }
 
 fn parse_window_limit(value: &str) -> Option<(i32, i32)> {
