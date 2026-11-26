@@ -255,6 +255,42 @@ static CALLS: Mutex<Vec<(u32, &'static str, String, u64)>> = Mutex::new(Vec::new
 thread_local! {
     /// The pipeline this thread is making (its shaders), for [`CALLS`].
     static LABEL: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    /// Whether the pipeline this thread makes has static samplers
+    /// ([`with_static_samplers`]).
+    static STATIC_SAMPLERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The pipelines this thread makes while the guard lives have static
+/// samplers: they are made, never loaded from or stored in the library,
+/// unless `VICTORY_LIBRARY_STATIC_SAMPLERS=1`.
+///
+/// Why (adapted from readmet3xt-lab/foxhound 7fa0e95, GPL-3): the NVIDIA
+/// driver keeps static samplers in a table of its own and puts their places
+/// in that table into the compiled pipeline. A pipeline loaded from the
+/// library in another process keeps the places of the process that stored
+/// it; where that process made static samplers in another order they are
+/// other samplers. The title's composite then reads its colour-grading
+/// tables unfiltered: posterized light over the whole picture, in some runs
+/// and not in others.
+pub(crate) fn with_static_samplers(samplers: bool) -> StaticSamplers {
+    StaticSamplers(STATIC_SAMPLERS.replace(samplers && !static_samplers_kept()))
+}
+
+/// Gives the earlier setting back when dropped ([`with_static_samplers`]).
+pub(crate) struct StaticSamplers(bool);
+
+impl Drop for StaticSamplers {
+    fn drop(&mut self) {
+        STATIC_SAMPLERS.set(self.0);
+    }
+}
+
+/// `VICTORY_LIBRARY_STATIC_SAMPLERS=1`: as before the guard.
+fn static_samplers_kept() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_LIBRARY_STATIC_SAMPLERS").is_some_and(|v| v == "1")
+    })
 }
 
 /// Names the pipeline this thread makes next.
@@ -520,7 +556,7 @@ pub(crate) fn pipeline(
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
     let wide = HSTRING::from(name);
-    let Some(library) = library() else {
+    let Some(library) = library().filter(|_| !STATIC_SAMPLERS.get()) else {
         MADE.fetch_add(1, Ordering::Relaxed);
         let _p = victory_core::prof_scope!("pipe.compile");
         return create();

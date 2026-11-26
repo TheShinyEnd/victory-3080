@@ -670,6 +670,8 @@ impl HostPipeline {
             }
             bound.push(stage);
         }
+        // Not from the library if it has static samplers (`library::with_static_samplers`).
+        let _samplers = super::library::with_static_samplers(!samplers.is_empty());
         let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
             Ok(root) => root,
             Err(e) => {
