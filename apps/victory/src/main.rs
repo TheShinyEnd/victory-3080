@@ -124,6 +124,12 @@ enum Command {
         /// Only the pipelines earlier runs drew with.
         #[arg(long)]
         used: bool,
+        /// LOCAL: make them into the run's pipeline library (host-pipelines.bin)
+        /// in this process, on `--jobs` threads, so that the next run loads
+        /// them in microseconds (the driver's cache alone did not shorten a
+        /// cold start). Needs no earlier `warm` pass.
+        #[arg(long)]
+        library: bool,
         /// (What the processes it starts are given.)
         #[arg(long, hide = true)]
         these: Option<String>,
@@ -222,7 +228,7 @@ fn main() -> Result<()> {
         }
         Command::Shaders { paths, jobs } => translate::precompile(paths, jobs),
         #[cfg(windows)]
-        Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
+        Command::Warm { jobs, limit, again, used, library, these } => warm::run(jobs, limit, again, used, library, these),
         Command::Run {
             exe,
             unimplemented,

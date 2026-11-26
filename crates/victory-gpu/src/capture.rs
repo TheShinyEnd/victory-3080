@@ -150,6 +150,10 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
     }
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let before = LAST.swap(drawn, Relaxed);
+    #[cfg(windows)]
+    if drawn.saturating_sub(before) >= 300 {
+        crate::pipeline::world_started();
+    }
     if world_on()
         && drawn.saturating_sub(before) >= 500
         && WORLD.compare_exchange(u64::MAX, frame, Relaxed, Relaxed).is_ok()

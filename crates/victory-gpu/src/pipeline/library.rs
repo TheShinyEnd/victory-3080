@@ -740,6 +740,7 @@ pub(crate) fn note_time(key: &str, ms: u64) {
         *known = ms;
         // With the next save of the early list.
         USED_CHANGED.store(true, Ordering::Relaxed);
+        UNFLUSHED.store(true, Ordering::Relaxed);
     }
 }
 
@@ -780,7 +781,47 @@ pub(crate) fn note_used(key: &str) {
     let set = used.get_or_insert_with(HashSet::new);
     if set.len() < EARLY_MAX && set.insert(key.to_owned()) {
         USED_CHANGED.store(true, Ordering::Relaxed);
+        UNFLUSHED.store(true, Ordering::Relaxed);
+        drop(used);
+        start_flusher();
     }
+}
+
+/// LOCAL (warm-up): the used list and the slow list are written within
+/// seconds of a change, by a thread of their own. They used to go out only
+/// with a library save (at most every 20 s, and only when a worker had just
+/// made a pipeline), so a run that was ended from outside (the harness's
+/// stop, a crash, the title's watchdog) lost what its last minute had drawn
+/// with for the next start.
+static UNFLUSHED: AtomicBool = AtomicBool::new(false);
+
+fn start_flusher() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let spawned = std::thread::Builder::new().name("victory-used-flush".into()).spawn(|| {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                if !UNFLUSHED.swap(false, Ordering::Relaxed) {
+                    continue;
+                }
+                let Some(dir) = DIR.get() else { continue };
+                let used: Vec<String> = self::used().iter().flatten().cloned().collect();
+                let slow: Vec<String> = slow_ones().iter().flatten().map(|(key, ms)| format!("{key} {ms}")).collect();
+                let written = std::fs::create_dir_all(dir)
+                    .and_then(|()| write_atomically(&dir.join(SLOW_FILE), slow.join("
+").as_bytes()))
+                    .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("
+").as_bytes()));
+                if let Err(e) = written {
+                    UNFLUSHED.store(true, Ordering::Relaxed);
+                    tracing::warn!(error = %e, "the used pipelines are not written down");
+                }
+            }
+        });
+        if let Err(e) = spawned {
+            tracing::warn!(error = %e, "no thread to write the used pipelines down");
+        }
+    });
 }
 
 #[cfg(test)]

@@ -600,7 +600,7 @@ fn hand_out(
     #[cfg(windows)]
     let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
     #[cfg(windows)]
-    known::note(host.key(), &shaders, host.graphics.as_deref());
+    known::note(host.key(), &shaders, host.graphics.as_deref(), false);
     #[cfg(windows)]
     make::early(&host);
     #[cfg(windows)]
@@ -799,6 +799,13 @@ mod make;
 #[cfg(windows)]
 pub(crate) fn wait_budget_ms() -> u64 {
     make::wait_budget().as_millis() as u64
+}
+
+/// LOCAL (warm-up): the title is drawing a world (a frame of 300 draws or
+/// more); see `make::world_started`.
+#[cfg(windows)]
+pub(crate) fn world_started() {
+    make::world_started();
 }
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline

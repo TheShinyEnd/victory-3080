@@ -26,12 +26,22 @@ fn folder() -> Result<PathBuf> {
     Ok(cfg.cache_subdir("shaders")?.with_file_name("pipelines"))
 }
 
-pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, these: Option<String>) -> Result<()> {
+pub fn run(
+    jobs: Option<usize>,
+    limit: Option<usize>,
+    again: bool,
+    used: bool,
+    library: bool,
+    these: Option<String>,
+) -> Result<()> {
     let dir = folder()?;
     if let Some(these) = these {
         return make(&dir, &these);
     }
     let began = Instant::now();
+    if library {
+        return into_library(&dir, jobs, limit, used);
+    }
     victory_hle::known_pipelines::use_translations(dir.with_file_name("shaders"));
     let fingerprint = known::fingerprint();
     let done_file = dir.join("warm-done.txt");
@@ -89,7 +99,8 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
                             state.0.push(ms);
                             state.1 += usize::from(!there);
                             let count = state.0.len();
-                            if count % 1000 == 0 {
+                            // LOCAL: a line every 250 (a `--used` list is a few thousand long).
+                            if count % 250 == 0 {
                                 println!("{count} of {}, {:.0} s", all.len(), began.elapsed().as_secs_f64());
                             }
                             drop(state);
@@ -207,4 +218,58 @@ fn make(dir: &Path, these: &str) -> Result<()> {
     // Without what a run's end does (nothing to save, the host's threads).
     let _ = out.flush();
     std::process::exit(0)
+}
+
+/// LOCAL: `warm --library`: the pipelines of the book (with `--used`: those
+/// earlier runs drew with) made on `jobs` threads of this process, into the
+/// pipeline library, which is saved at the end. A pipeline the library has
+/// already loads at once, so a second pass costs seconds. Unlike the child
+/// processes of the other mode, a compiler that crashes ends the pass, and
+/// nothing is saved then (run it again with `--limit` steps if one does).
+fn into_library(dir: &Path, jobs: Option<usize>, limit: Option<usize>, used: bool) -> Result<()> {
+    let began = Instant::now();
+    let cfg = victory_core::Config::load()?;
+    victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
+    let keys = known::keys(dir);
+    let early = std::fs::read_to_string(dir.join("early-pipelines.txt")).unwrap_or_default();
+    let early: HashSet<&str> = early.lines().collect();
+    let bad = std::fs::read_to_string(dir.join("warm-bad.txt")).unwrap_or_default();
+    let bad: HashSet<&str> = bad.lines().filter_map(|l| l.split(' ').next()).collect();
+    let mut all: Vec<usize> = (0..keys.len())
+        .filter(|&n| !bad.contains(keys[n].as_str()) && (!used || early.contains(keys[n].as_str())))
+        .collect();
+    all.sort_by_key(|&n| (!early.contains(keys[n].as_str()), &keys[n]));
+    all.truncate(limit.unwrap_or(usize::MAX));
+    let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let jobs = jobs.unwrap_or(cores * 2 / 3).max(1);
+    println!("{} pipelines known, {} to make into the library, {jobs} threads", keys.len(), all.len());
+    const BATCH: usize = 40;
+    let chunks: Vec<&[usize]> = all.chunks(BATCH).collect();
+    let next = AtomicUsize::new(0);
+    let state = Mutex::new((0usize, 0usize));
+    std::thread::scope(|s| {
+        for _ in 0..jobs.min(chunks.len()) {
+            s.spawn(|| {
+                while let Some(&chunk) = chunks.get(next.fetch_add(1, Ordering::Relaxed)) {
+                    known::make(dir, chunk, |_, came| {
+                        if let Some((_, there)) = came {
+                            let mut st = lock(&state);
+                            st.0 += 1;
+                            st.1 += usize::from(!there);
+                            if st.0 % 250 == 0 {
+                                println!("{} of {}, {:.0} s", st.0, all.len(), began.elapsed().as_secs_f64());
+                            }
+                        }
+                    });
+                }
+            });
+        }
+    });
+    let (made, none) = state.into_inner().unwrap_or_else(|e| e.into_inner());
+    known::save_library();
+    println!(
+        "{made} pipelines in the library in {:.0} s ({none} have no host pipeline); library saved",
+        began.elapsed().as_secs_f64()
+    );
+    Ok(())
 }

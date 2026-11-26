@@ -37,10 +37,33 @@ const PIPELINES: &str = "known-pipelines.bin";
 const STAGES: [&str; 8] =
     ["vertex", "pixel", "domain", "hull", "geometry", "compute", "amplification", "mesh"];
 
-/// `VICTORY_PIPELINE_BOOK=1`: the pipelines the title creates are kept.
+/// Which pipelines the book keeps (`VICTORY_PIPELINE_BOOK`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Off,
+    /// LOCAL (warm-up): the pipelines a draw or dispatch asked for, noted at
+    /// their first use (a few thousand, instead of the title's 84,000), the
+    /// ones `victory warm --used` makes ahead. The default: a session writes
+    /// down what it touched with no switch to remember. Variants made for
+    /// other render target formats are noted too (the title never creates
+    /// those).
+    Used,
+    /// `VICTORY_PIPELINE_BOOK=1` (or `all`): every pipeline the title creates,
+    /// as before (and the used ones, the variants among them).
+    All,
+}
+
+fn mode() -> Mode {
+    static MODE: OnceLock<Mode> = OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_PIPELINE_BOOK").as_deref() {
+        Ok("0") => Mode::Off,
+        Ok("1" | "all") => Mode::All,
+        _ => Mode::Used,
+    })
+}
+
 fn on() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_BOOK").is_some_and(|v| v == "1"))
+    mode() != Mode::Off
 }
 
 struct Book {
@@ -87,8 +110,12 @@ fn book() -> Option<&'static Mutex<Book>> {
     .as_ref()
 }
 
-/// The title created a pipeline.
-pub(super) fn note(key: &str, shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>) {
+/// The title created a pipeline (`at_use` false), or a draw or dispatch asked
+/// for it the first time (`at_use` true; see [`Mode`]).
+pub(super) fn note(key: &str, shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>, at_use: bool) {
+    if !at_use && mode() != Mode::All {
+        return;
+    }
     let Some(book) = book() else { return };
     let mut id = [0u8; 16];
     for (at, b) in id.iter_mut().enumerate() {
@@ -206,6 +233,17 @@ pub fn fingerprint() -> String {
         h.update(&host.driver().to_le_bytes());
     }
     h.finalize().to_hex()[..16].to_owned()
+}
+
+/// LOCAL (warm-up): the pipeline library and the lists live in `dir` for
+/// this process (`victory warm --library`).
+pub fn use_library(dir: PathBuf) {
+    super::library::use_pipeline_cache(dir);
+}
+
+/// LOCAL: writes the library out (what [`make`] stored into it).
+pub fn save_library() {
+    super::library::save(true);
 }
 
 /// The translations of earlier runs are in `dir` (the pipeline library is

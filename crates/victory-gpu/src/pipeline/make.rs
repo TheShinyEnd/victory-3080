@@ -326,6 +326,8 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     // on the next launch, even if this run never got to use it.
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
         super::library::note_used(&p.key);
+        // LOCAL (warm-up): the pipeline book keeps what a session touched.
+        super::known::note(&p.key, &p.shaders, p.graphics.as_deref(), true);
     }
     if p.made.get().is_none() {
         let _p = victory_core::prof_scope!("pipe.request");
@@ -386,11 +388,49 @@ fn wait_once() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_ONCE").is_none_or(|v| v != "0"))
 }
 
+/// LOCAL (warm-up): when a world was first drawn (a frame of 300 draws or
+/// more), in `crate::host::now_ms` plus one so that 0 means not yet.
+static WORLD_AT: AtomicU64 = AtomicU64::new(0);
+/// The world has been drawn this long, and no more than [`BACKLOG`]
+/// pipelines wait for the workers: its loading is over (a cold start has
+/// hundreds queued for minutes).
+const SETTLE_AFTER_MS: u64 = 10_000;
+const BACKLOG: u64 = 8;
+
+/// The title drew a frame of 300 draws or more.
+pub(crate) fn world_started() {
+    if WORLD_AT.load(Ordering::Relaxed) == 0 {
+        let _ = WORLD_AT.compare_exchange(0, crate::host::now_ms() + 1, Ordering::Relaxed, Ordering::Relaxed);
+    }
+}
+
+/// LOCAL (warm-up): once the world is drawn and the backlog of pipelines
+/// is small ([`BACKLOG`]), a frame waits at most this long in all for pipelines it
+/// meets for the first time (`VICTORY_PIPELINE_PLAY_WAIT_MS`, default 25;
+/// `off`: the budgets above, as before). A pipeline of a place not seen
+/// before is made by the workers while its draws are dropped, and the
+/// frame goes on: the picture of that place fills in over the next
+/// frames, where a wait of seconds stopped every frame it was asked in
+/// (a cold-start budget of 10 s is right while the world loads, and
+/// wrong for the rest of the session).
+fn play_cap() -> Option<Duration> {
+    static CAP: OnceLock<Option<Duration>> = OnceLock::new();
+    let cap = *CAP.get_or_init(|| match std::env::var("VICTORY_PIPELINE_PLAY_WAIT_MS").as_deref() {
+        Ok("off") => None,
+        Ok(v) => Some(Duration::from_millis(v.trim().parse().unwrap_or(25))),
+        Err(_) => Some(Duration::from_millis(25)),
+    });
+    let world = WORLD_AT.load(Ordering::Relaxed);
+    let settled = world != 0 && crate::host::now_ms() + 1 >= world + SETTLE_AFTER_MS && WAITING.load(Ordering::Relaxed) <= BACKLOG;
+    if settled { cap } else { None }
+}
+
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
     let _p = victory_core::prof_scope!("pipe.wait");
     let screen = p.screen && screens_first();
     let budget = if screen { screen_budget() } else { wait_budget() };
+    let budget = play_cap().map_or(budget, |cap| budget.min(cap));
     if budget.is_zero() {
         return;
     }
