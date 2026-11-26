@@ -459,6 +459,9 @@ thread_local! {
     static RAW: std::cell::RefCell<Option<Vec<u8>>> = const { std::cell::RefCell::new(None) };
     /// The form the last [`emit`] on this thread took ([`last_form`]).
     static FORM: std::cell::Cell<&'static str> = const { std::cell::Cell::new("direct") };
+    /// The host's name for the program being translated (its pipeline hash), for
+    /// `VICTORY_EXACT64_SKIP`/`_ONLY` and `VICTORY_WAVE_WHY` ([`set_program_label`]).
+    static LABEL: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
     /// Whether the exact wave64 stage already ran for this program.
     static EXACT64_TRIED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -474,6 +477,65 @@ pub fn last_form() -> &'static str {
     FORM.with(|f| f.get())
 }
 
+/// Names the program the next translation on this thread makes (the host's pipeline hash).
+pub fn set_program_label(label: &str) {
+    LABEL.with(|l| {
+        let mut l = l.borrow_mut();
+        l.clear();
+        l.push_str(label);
+    });
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Whether `VICTORY_EXACT64_SKIP` / `VICTORY_EXACT64_ONLY` (comma lists of substrings of the
+/// program's label (pipeline hash) or its container digest) let the exact stage take it.
+fn exact64_allowed(digest: &str) -> bool {
+    let label = LABEL.with(|l| l.borrow().clone());
+    let hit = |var: &str| -> Option<bool> {
+        let v = std::env::var(var).ok()?;
+        let v = v.trim().to_ascii_lowercase();
+        if v.is_empty() {
+            return None;
+        }
+        Some(v.split(',').map(str::trim).filter(|s| !s.is_empty()).any(|s| {
+            (!label.is_empty() && label.to_ascii_lowercase().contains(s)) || digest.contains(s)
+        }))
+    };
+    // The GenerateShadowMasks family (container digests): live, `CS_GenerateShadowMasks_HairOnly`
+    // (13d14336) through this stage drew blocky bright halos in 16-pixel tiles round the hair
+    // and shoulders (bisected: `VICTORY_EXACT64_SKIP=0a5ecfee6b79e13b` removes them). Cause not
+    // found; its siblings share the code, so all stay with the fork's previous behaviour. Named
+    // in `VICTORY_EXACT64_ONLY` a program is still taken; `VICTORY_EXACT64_DEFAULT_SKIP=0` lifts the list.
+    // Second group (run wave-skipB): with the 9 programs below skipped, a stair-stepped (16 px
+    // per step) silhouette edge on the character's shoulder, left after the first group was held
+    // back, went away; skipping 9 other lighting programs (wave-skipA) did not remove it. Which of
+    // the 9 does it is not known (the cascade shadow tile programs are the likeliest).
+    const HELD_BACK: [&str; 14] = [
+        "96145550a0c67e48d3e75f0b06011f7e", // CS_ShadowRenderTiledCascadesCBPPPC
+        "39d2983b3f1a41e093907e218a8d1177", // CS_ShadowRenderTiledCascadesPPPC
+        "e387b84fdc0cf22389a6f89195b72176", // CS_ShadowRenderTiledCascadesAlphaCBPPPC
+        "68bf77351adc9d64acb745b22d0be9d3", // CS_ShadowRenderTiledMiscAlphaPPPC
+        "92328756091f4dd762494dc07e8d80ac", // ptfx_CS_lightAtlas_Sprite
+        "cba79ed7e1b4e5273fa4895a502cef0a", // ptfx_CS_lightAtlas_Trail
+        "0fc5f6c655904e0863975f9e388090d7", // CS_GatherDensityAreaForReadBack
+        "87f6d16d1b30f8319d5fa7cc136b96fc", // CS_GatherDiffusion
+        "4179943de444c2fd55cccef9d0ceb75b", // CS_DisturbersContribution (water foam)
+        "72620bc81caddeb38df9319cddcbd29d", // CS_GenerateShadowMasks
+        "846fb6fb5fa1e2c9d3093c70d1b87b38", // CS_GenerateShadowMasks_Raytraced
+        "ee48bcb1aac85b7a51a61c237a4e104b", // CS_GenerateShadowMasks_HairOnly
+        "c03eff8906e3e545fb894f4be45491c2", // CS_GenerateShadowMasks_SampleHairScreenSpace
+        "ead53d2b9c04a91a11bed4b81d8aa447", // CS_GenerateShadowMasksHairOnly_SampleHairScreenSpace
+    ];
+    let named = hit("VICTORY_EXACT64_ONLY") == Some(true);
+    let held = HELD_BACK.contains(&digest)
+        && !named
+        && std::env::var_os("VICTORY_EXACT64_DEFAULT_SKIP").is_none_or(|v| v != "0");
+    hit("VICTORY_EXACT64_ONLY").is_none_or(|h| h) && !hit("VICTORY_EXACT64_SKIP").unwrap_or(false) && !held
+}
+
 fn note_form(form: &'static str) {
     FORM.with(|f| f.set(form));
     if std::env::var_os("VICTORY_WAVE_WHY").is_some() && form != "direct" {
@@ -484,13 +546,19 @@ fn note_form(form: &'static str) {
 /// The exact wave64 stage: the program through [`crate::exact64`]'s
 /// predicated console flow, for a wave64 compute program on a host of
 /// 32-lane waves. Once per program.
-fn exact64(native: &NativeProgram) -> Option<HostShader> {
+fn exact64(native: &NativeProgram, digest: &str) -> Option<HostShader> {
     if native.stage != HwStage::Cs
         || !native.wave64
         || lower::host_max_wave() != 32
         || !crate::exact64::bridge::enabled()
         || EXACT64_TRIED.with(|t| t.replace(true))
     {
+        return None;
+    }
+    if !exact64_allowed(digest) {
+        if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+            eprintln!("WAVE64-RETRY exact64: left out by VICTORY_EXACT64_SKIP/_ONLY");
+        }
         return None;
     }
     let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
@@ -520,11 +588,21 @@ pub fn emit(
 ) -> Result<HostShader, ShaderError> {
     EXACT64_TRIED.with(|t| t.set(false));
     note_form("direct");
-    let out = emit_chain(c, native, p, st, io, res);
+    let digest = hex(&c.digest);
+    let out = emit_chain(c, native, p, st, io, res, &digest);
+    if native.stage == HwStage::Cs
+        && native.wave64
+        && lower::host_max_wave() == 32
+        && std::env::var_os("VICTORY_WAVE_WHY").is_some()
+    {
+        let label = LABEL.with(|l| l.borrow().clone());
+        let form = if out.is_ok() { last_form() } else { "refused" };
+        eprintln!("WAVE64-PROGRAM hash={label} digest={digest} form={form}");
+    }
     // Refused by every form above: the exact stage once more (it ran
     // already when the chain reached it).
     if matches!(out, Err(ShaderError::Unsupported { .. }))
-        && let Some(shader) = exact64(native)
+        && let Some(shader) = exact64(native, &digest)
     {
         return Ok(shader);
     }
@@ -538,6 +616,7 @@ fn emit_chain(
     st: &structure::Structured,
     io: &io::Io,
     res: &resource::Resources,
+    digest: &str,
 ) -> Result<HostShader, ShaderError> {
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
@@ -699,7 +778,7 @@ fn emit_chain(
                 }
                 // Still stopped: the exact predicated console flow, before
                 // anything approximate (and under `VICTORY_WAVE_LOCAL=idiom`).
-                if let Some(shader) = exact64(native) {
+                if let Some(shader) = exact64(native, digest) {
                     return Ok(shader);
                 }
                 if strict {

@@ -151,6 +151,7 @@ impl Shader {
                 let began = std::time::Instant::now();
                 let done = {
                     let _p = victory_core::prof_scope!("shader.translate");
+                    victory_shader::emit::set_program_label(&self.hash);
                     translate(&self.container)
                 };
                 victory_core::prof_top!("shader.translate", began.elapsed().as_nanos(), || format!("{} {}", self.stage, self.hash));
