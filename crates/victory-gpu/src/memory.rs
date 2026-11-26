@@ -657,6 +657,21 @@ impl Memory {
 
     /// The pages shaders found empty since the last frame.
     fn take_faults(&mut self) {
+        // Dword 0 counts the node tests of a frame while `VICTORY_RT_STEP_CAP`
+        // is set: over the cap, the tests past it answered as misses.
+        if let Some(cap) = victory_shader::emit::step_cap() {
+            // SAFETY: inside the faults' mapping, as below.
+            let count = unsafe { self.faults.1.read_volatile() };
+            // SAFETY: as above.
+            unsafe { self.faults.1.write_volatile(0) };
+            static FRAMES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let frames = FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if count >= cap {
+                tracing::warn!(frame = self.frame, tests = count, cap, "rt step cap: a frame's ray node tests passed the cap (the rest answered as misses)");
+            } else if frames.is_multiple_of(200) && count > 0 {
+                tracing::info!(frame = self.frame, tests = count, cap, "rt step cap: node tests in a frame");
+            }
+        }
         let mut pages = Vec::new();
         for i in 1..MEMORY_FAULTS as usize {
             // SAFETY: inside the faults' mapping; the GPU may be writing,

@@ -10,6 +10,8 @@
 
 #[cfg(windows)]
 pub mod apu;
+#[cfg(windows)]
+pub mod bvhbuilder;
 pub mod audio;
 pub mod d3d12x;
 pub mod display;
@@ -57,6 +59,8 @@ pub(crate) fn all() -> Vec<HleModule> {
     ];
     #[cfg(windows)]
     all.push(apu::module());
+    #[cfg(windows)]
+    all.push(bvhbuilder::module());
     #[cfg(windows)]
     all.push(media::module());
     #[cfg(windows)]

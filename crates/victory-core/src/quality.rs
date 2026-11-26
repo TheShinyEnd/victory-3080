@@ -118,6 +118,10 @@ pub static OPTIONS: &[Opt] = &[
         "HDR only: the brightness in nits of SDR white (the interface, menus and the numbers panel; default 200). The game's own HDR picture is not changed by it.",
         "None"),
     // --- Lighting & ray tracing
+    opt!("ray_tracing", "VICTORY_RT", "Lighting & ray tracing",
+        Kind::Choice(&[("miss", ""), ("off", "off"), ("cpu", "cpu")]), ["miss", "miss", "miss", "miss"],
+        "miss: rays end at the root (no traced shadows or bounced light; the stand-in light below fills in). off: as miss, and the ~1,034 ray-tracing resolve and traced-shadow shaders are skipped (fastest). cpu: the title's ray-tracing structures are built on the CPU (XboxBvhBuilder replaced) and the rays are walked for real: traced shadows, bounced light, reflections; EXPERIMENTAL.",
+        "off is fastest; cpu costs CPU time for every build and GPU time for every ray"),
     opt!("ray_miss", "VICTORY_BVH_MISS", "Lighting & ray tracing", ON1, ["1", "1", "1", "1"],
         "Rays end at the root (miss) while the structure builder is off. Off: the title's ray walks run and may hang on stale structures.",
         "On is faster and avoids hangs; off needs the structure builder (not available on NVIDIA)"),
@@ -294,7 +298,22 @@ pub fn resolve(file: &File) -> Result<Vec<(String, String)>> {
     if !errors.is_empty() {
         bail!("{}", errors.join("; "));
     }
+    ray_tracing_links(&mut out);
     Ok(out)
+}
+
+/// `ray_tracing` decides two other variables: `cpu` walks the rays for real (no miss restart, nothing skipped), `off`
+/// misses them and skips the passes that trace.
+fn ray_tracing_links(out: &mut Vec<(String, String)>) {
+    let Some(mode) = out.iter().find(|(n, _)| n == "VICTORY_RT").map(|(_, v)| v.clone()) else { return };
+    let (miss, skip) = match mode.as_str() {
+        "cpu" => ("0", "none"),
+        "off" => ("1", "list"),
+        _ => return,
+    };
+    out.retain(|(n, _)| n != "VICTORY_BVH_MISS" && n != "VICTORY_SKIP_PIPELINES");
+    out.push(("VICTORY_BVH_MISS".to_owned(), miss.to_owned()));
+    out.push(("VICTORY_SKIP_PIPELINES".to_owned(), skip.to_owned()));
 }
 
 /// Expands the `list` word of `VICTORY_SKIP_PIPELINES` to the hashes of `rt_off_hashes.txt` (found through
@@ -451,6 +470,24 @@ mod tests {
         let e = resolve(&bad).unwrap_err().to_string();
         assert!(e.contains("ambient_air") && e.contains("nope"), "{e}");
         assert!(File::parse("preset = \"x\"").unwrap().preset_index().is_err());
+    }
+
+    #[test]
+    fn ray_tracing_modes_set_the_miss_restart_and_the_skip_list() {
+        let v = |text: &str| -> BTreeMap<_, _> { resolve(&File::parse(text).unwrap()).unwrap().into_iter().collect() };
+        let cpu = v("preset = \"performance\"
+[options]
+ray_tracing = \"cpu\"");
+        assert_eq!(cpu["VICTORY_RT"], "cpu");
+        assert_eq!(cpu["VICTORY_BVH_MISS"], "0");
+        assert_eq!(cpu["VICTORY_SKIP_PIPELINES"], "none");
+        let off = v("preset = \"quality\"
+[options]
+ray_tracing = \"off\"");
+        assert_eq!((off["VICTORY_BVH_MISS"].as_str(), off["VICTORY_SKIP_PIPELINES"].as_str()), ("1", "list"));
+        let miss = v("preset = \"quality\"");
+        assert!(!miss.contains_key("VICTORY_RT"));
+        assert_eq!(miss["VICTORY_BVH_MISS"], "1");
     }
 
     #[test]

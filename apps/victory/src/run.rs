@@ -284,6 +284,11 @@ fn poke(base: usize, size: usize) {
 /// DLLs the host or our runtime provide are never taken from the title.
 #[cfg(windows)]
 fn title_dll(host: &victory_hle::HostPolicy, dll: &str) -> bool {
+    // The structure builder's DLL stays mapped when `VICTORY_RT=cpu` serves its
+    // builder calls (`modules::bvhbuilder`): its own CPU entry points are used.
+    if dll.eq_ignore_ascii_case("xboxbvhbuilder.dll") {
+        return true;
+    }
     !host.allows(dll) && !victory_hle::registry().iter().any(|m| m.serves(dll))
 }
 

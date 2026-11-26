@@ -67,6 +67,21 @@ fn bvh_miss() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_MISS").is_some_and(|v| v == "1"))
 }
 
+/// LOCAL: `VICTORY_RT_STEP_CAP=n` (diagnostics; off unless set): a frame's
+/// node tests over title memory are counted in dword 0 of the faults buffer
+/// (which the host reads and clears once a frame and logs), and the tests past
+/// `n` million answer as a miss (a box with no child, a triangle missed), so a
+/// walk over a structure that is not right ends at its next node instead of
+/// hanging the card. The cap is a budget for the frame, not a bound for a
+/// walk; it is counted over all lanes.
+pub fn step_cap() -> Option<u32> {
+    static CAP: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        let n: u32 = std::env::var("VICTORY_RT_STEP_CAP").ok()?.trim().parse().ok()?;
+        (n > 0).then_some(n.saturating_mul(1 << 20))
+    })
+}
+
 impl<'a> Lower<'a> {
     /// `image_bvh_intersect_ray` and `image_bvh64_intersect_ray`.
     pub(super) fn bvh(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
@@ -185,6 +200,26 @@ impl<'a> Lower<'a> {
         let zero = self.s.m.i32(0);
         let gate = self.begin_guarded(guard);
         let head = self.cur;
+        // With the step cap: count this test, and note whether the frame's
+        // budget is spent (`VICTORY_RT_STEP_CAP`).
+        let over = match (step_cap(), nodes) {
+            (Some(cap), BvhNodes::Memory { .. }) => {
+                let i32t = self.s.t.i32;
+                let faults = self.s.root_uav_handle(crate::emit::SLOT_FAULTS);
+                let (add, first, one, iu) = (self.s.m.i32(0), self.s.m.i32(0), self.s.m.i32(1), self.s.m.undef(i32t));
+                let before = self.s.op(
+                    head,
+                    "atomicBinOp.i32",
+                    Attr::NoUnwind,
+                    i32t,
+                    78,
+                    &[faults, add, first, iu, iu, one],
+                );
+                let limit = self.s.m.i32(cap);
+                Some(self.s.m.cmp(head, pred::IUGE, before, limit))
+            }
+            _ => None,
+        };
         let (k4, k6, k7) = (self.s.m.i32(4), self.s.m.i32(6), self.s.m.i32(7));
         let kind = self.s.m.bin(head, Bin::And, pointer, k7);
         let pair = self.s.m.bin(head, Bin::And, pointer, k6);
@@ -233,7 +268,17 @@ impl<'a> Lower<'a> {
                     (other[k], leaf_block),
                 ],
             );
-            results.push((phi, zero));
+            let value = match over {
+                // Past the cap: a box has no child, anything else misses.
+                Some(over) => {
+                    let miss = self.s.m.i32(bvh::MISS[k].to_bits());
+                    let none = self.s.m.i32(bvh::NONE);
+                    let miss = self.s.m.select(join, is_box, none, miss);
+                    self.s.m.select(join, over, miss, phi)
+                }
+                None => phi,
+            };
+            results.push((value, zero));
         }
         let results = self.end_guarded(gate, &results);
         for (k, &r) in results.iter().enumerate() {

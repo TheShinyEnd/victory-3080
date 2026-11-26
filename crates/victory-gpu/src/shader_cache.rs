@@ -64,6 +64,8 @@ fn build() -> [u8; 32] {
         // executable had cached with the switch unset.
         for name in [
             "VICTORY_BVH_MISS",
+            // LOCAL: the cap on ray node tests is in the code (`VICTORY_RT_STEP_CAP`).
+            "VICTORY_RT_STEP_CAP",
             // LOCAL: colours and image stores with NaN made 0.
             "VICTORY_NAN_SCRUB",
             // LOCAL (fxceless #1216): constant buffer slots marked.

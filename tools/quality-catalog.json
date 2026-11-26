@@ -214,6 +214,29 @@
    "cost": "None"
   },
   {
+   "key": "ray_tracing",
+   "env": "VICTORY_RT",
+   "group": "Lighting & ray tracing",
+   "kind": "choice",
+   "words": [
+    "miss",
+    "off",
+    "cpu"
+   ],
+   "min": 0,
+   "max": 0,
+   "presets": [
+    "miss",
+    "miss",
+    "miss",
+    "miss"
+   ],
+   "live": false,
+   "needs_hooks": false,
+   "help": "miss: rays end at the root (no traced shadows or bounced light; the stand-in light below fills in). off: as miss, and the ~1,034 ray-tracing resolve and traced-shadow shaders are skipped (fastest). cpu: the title's ray-tracing structures are built on the CPU (XboxBvhBuilder replaced) and the rays are walked for real: traced shadows, bounced light, reflections; EXPERIMENTAL.",
+   "cost": "off is fastest; cpu costs CPU time for every build and GPU time for every ray"
+  },
+  {
    "key": "ray_miss",
    "env": "VICTORY_BVH_MISS",
    "group": "Lighting & ray tracing",
