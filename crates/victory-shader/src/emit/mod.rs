@@ -408,6 +408,13 @@ pub struct UserData {
 /// already translated came out changed (an extra evaluation in each), for
 /// the sake of 9 that did not translate.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+    RAW.with(|r| *r.borrow_mut() = Some(container.to_vec()));
+    let out = translate_inner(container);
+    RAW.with(|r| *r.borrow_mut() = None);
+    out
+}
+
+fn translate_inner(container: &[u8]) -> Result<HostShader, ShaderError> {
     match translate_plain(container) {
         Err(ShaderError::Unsupported { what, .. }) if what == lower::FIRST_HALF => {
             lower::with_first_half_pairs(|| translate_plain(container))
@@ -444,8 +451,85 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     emit(&c, &native, &p, &st, &io, &res)
 }
 
+thread_local! {
+    /// The container bytes of the translation this thread is making (the
+    /// exact wave64 stage re-reads them: [`crate::exact64`]).
+    static RAW: std::cell::RefCell<Option<Vec<u8>>> = const { std::cell::RefCell::new(None) };
+    /// The form the last [`emit`] on this thread took ([`last_form`]).
+    static FORM: std::cell::Cell<&'static str> = const { std::cell::Cell::new("direct") };
+    /// Whether the exact wave64 stage already ran for this program.
+    static EXACT64_TRIED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Which form the last translation on this thread took: "direct" (the
+/// program as it is), the retry forms of a wave64 program on a 32-lane host
+/// ("without early-outs", "without skips", "without skips, scalars
+/// followed", "wave-wide branches", "local waves (idiom)"), "exact64" (the
+/// predicated console flow of [`crate::exact64`], exact),
+/// "APPROXIMATE local waves" (each host half-wave its own wave; the results
+/// are not the console's) or "threaded". `VICTORY_WAVE_WHY=1` prints it too.
+pub fn last_form() -> &'static str {
+    FORM.with(|f| f.get())
+}
+
+fn note_form(form: &'static str) {
+    FORM.with(|f| f.set(form));
+    if std::env::var_os("VICTORY_WAVE_WHY").is_some() && form != "direct" {
+        eprintln!("WAVE64-FORM-TAKEN {form}");
+    }
+}
+
+/// The exact wave64 stage: the program through [`crate::exact64`]'s
+/// predicated console flow, for a wave64 compute program on a host of
+/// 32-lane waves. Once per program.
+fn exact64(native: &NativeProgram) -> Option<HostShader> {
+    if native.stage != HwStage::Cs
+        || !native.wave64
+        || lower::host_max_wave() != 32
+        || !crate::exact64::bridge::enabled()
+        || EXACT64_TRIED.with(|t| t.replace(true))
+    {
+        return None;
+    }
+    let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
+    let raw = RAW.with(|r| r.borrow().clone())?;
+    match crate::exact64::bridge::translate(&raw) {
+        Ok(shader) => {
+            note_form("exact64");
+            Some(shader)
+        }
+        Err(e) => {
+            if why {
+                eprintln!("WAVE64-RETRY exact64: {e}");
+            }
+            None
+        }
+    }
+}
+
 /// Emits a program whose earlier stages already ran.
 pub fn emit(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
+    EXACT64_TRIED.with(|t| t.set(false));
+    note_form("direct");
+    let out = emit_chain(c, native, p, st, io, res);
+    // Refused by every form above: the exact stage once more (it ran
+    // already when the chain reached it).
+    if matches!(out, Err(ShaderError::Unsupported { .. }))
+        && let Some(shader) = exact64(native)
+    {
+        return Ok(shader);
+    }
+    out
+}
+
+fn emit_chain(
     c: &Container,
     native: &NativeProgram,
     p: &ir::Program,
@@ -545,6 +629,7 @@ pub fn emit(
                 let again = emit_program(c, native, p, st, io, res);
                 report(name, &again);
                 if done(&again) {
+                    note_form(name);
                     return again.map(|(shader, _)| shader);
                 }
             }
@@ -587,6 +672,7 @@ pub fn emit(
                     let again = emit_program(c, native, p, st, io, res);
                     report("without skips, scalars followed", &again);
                     if done(&again) {
+                        note_form("without skips, scalars followed");
                         return again.map(|(shader, _)| shader);
                     }
                 }
@@ -604,9 +690,15 @@ pub fn emit(
                         let again = widen(c, native, base, why, driver_loop);
                         report("wave-wide branches", &again);
                         if done(&again) {
+                            note_form("wave-wide branches");
                             return again.map(|(shader, _)| shader);
                         }
                     }
+                }
+                // Still stopped: the exact predicated console flow, before
+                // anything approximate (and under `VICTORY_WAVE_LOCAL=idiom`).
+                if let Some(shader) = exact64(native) {
+                    return Ok(shader);
                 }
                 if strict {
                     break;
@@ -622,6 +714,7 @@ pub fn emit(
                     let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
                     report(&format!("local waves ({}), {name}", if exact { "idiom" } else { "APPROXIMATE" }), &local);
                     if done(&local) {
+                        note_form(if exact { "local waves (idiom)" } else { "APPROXIMATE local waves" });
                         return local.map(|(shader, _)| shader);
                     }
                 }
@@ -630,6 +723,7 @@ pub fn emit(
                 let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
                 report(if exact { "local waves (idiom)" } else { "local waves (APPROXIMATE)" }, &local);
                 if done(&local) {
+                    note_form(if exact { "local waves (idiom)" } else { "APPROXIMATE local waves" });
                     return local.map(|(shader, _)| shader);
                 }
             }
@@ -642,6 +736,7 @@ pub fn emit(
                         let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
                         report(&format!("local waves (APPROXIMATE, any mask), {name}"), &local);
                         if done(&local) {
+                            note_form("APPROXIMATE local waves (any mask)");
                             return local.map(|(shader, _)| shader);
                         }
                     }
@@ -649,6 +744,7 @@ pub fn emit(
                 let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
                 report("local waves (APPROXIMATE, any mask)", &local);
                 if done(&local) {
+                    note_form("APPROXIMATE local waves (any mask)");
                     return local.map(|(shader, _)| shader);
                 }
             }
@@ -665,7 +761,10 @@ pub fn emit(
         {
             let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some(), false);
             match again {
-                Ok(_) => again,
+                Ok(_) => {
+                    note_form("wave-wide branches");
+                    again
+                }
                 Err(_) => emit_program(c, native, p, st, io, res),
             }
         }
@@ -695,7 +794,11 @@ pub fn emit(
     let st = structure::structure(&p)?;
     let io = io::raise(&p, native)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-    emit_program(c, native, &p, &st, &io, &res).and_then(supported)
+    let threaded = emit_program(c, native, &p, &st, &io, &res).and_then(supported);
+    if threaded.is_ok() {
+        note_form("threaded");
+    }
+    threaded
 }
 
 /// `p` (a console wave64 compute program on a host of 32-lane waves) with the per-lane

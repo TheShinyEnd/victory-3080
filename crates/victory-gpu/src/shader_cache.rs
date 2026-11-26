@@ -72,6 +72,9 @@ fn build() -> [u8; 32] {
             "VICTORY_WAVE_DEEP_SKIPS",
             "VICTORY_WAVE_OWN_BITS",
             "VICTORY_WAVE_LOCAL",
+            // The exact wave64 stage (`victory_shader::exact64`).
+            "VICTORY_EXACT64",
+            "VICTORY_EXACT64_HEAP",
             "VICTORY_F16_NEAREST",
             "VICTORY_HELPER_OWN",
             "VICTORY_FIRSTLANE_OWN",

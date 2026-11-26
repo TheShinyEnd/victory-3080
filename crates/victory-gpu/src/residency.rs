@@ -351,7 +351,14 @@ pub(crate) fn mip_cap_bytes() -> u64 {
     let cap = match env_u64("VICTORY_TEXTURE_CAP_MB") {
         Some(0) => u64::MAX,
         Some(mb) => mb.min(1 << 20) << 20,
-        None if legacy() => u64::MAX,
+        // Off unless asked for: starting a copy below its top level changed
+        // the picture (colour banding over the whole frame, 2026-11-26: a
+        // big 2D texture read at its top level, noise or a table, was shown
+        // from an averaged level). `VICTORY_TEXTURE_CAP_MB=auto` sizes the
+        // cap from the card's budget as before.
+        None if legacy() || std::env::var("VICTORY_TEXTURE_CAP_MB").as_deref().map(str::trim) != Ok("auto") => {
+            return *CAP.get_or_init(|| u64::MAX);
+        }
         None => match crate::host::host().and_then(|h| h.video_memory()) {
             Some([budget, ..]) if budget > 0 => cap_for_budget(budget),
             // No device yet: no copies either; asked again.

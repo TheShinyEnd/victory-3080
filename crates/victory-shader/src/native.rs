@@ -593,7 +593,7 @@ fn unpack(blob: &[u8]) -> Result<Vec<u8>, ShaderError> {
 /// Inflates a zlib stream incrementally up to `expected` bytes, rejecting
 /// truncated, corrupt, under-filled, or oversized streams without eagerly
 /// allocating the full declared size up front.
-fn inflate_zlib_exact(source: &[u8], expected: usize) -> Option<Vec<u8>> {
+pub(crate) fn inflate_zlib_exact(source: &[u8], expected: usize) -> Option<Vec<u8>> {
     let mut state = zlib_rs::Inflate::new(true, 15);
     let mut out = Vec::new();
     let (mut in_pos, mut out_pos) = (0usize, 0usize);
