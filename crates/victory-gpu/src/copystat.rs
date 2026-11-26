@@ -214,10 +214,62 @@ static WAITS_BY_WORK: Mutex<Option<HashMap<String, (u64, u64)>>> = Mutex::new(No
 /// their microseconds, and the longest one's.
 static COMMANDS_BY_WORK: Mutex<Option<HashMap<String, (u64, u64, u64)>>> = Mutex::new(None);
 
+/// With `VICTORY_GPU_TIMING`: the same commands' time summed by PASS (the
+/// render targets a draw writes, by size and format, or the kind of other
+/// command): how many, their microseconds, the longest one's.
+static COMMANDS_BY_PASS: Mutex<Option<HashMap<String, (u64, u64, u64)>>> = Mutex::new(None);
+
+/// The pass a command's note belongs to: for a draw the sizes and formats of
+/// its targets and depth (pointers left out), else the first two words.
+fn pass_key(op: &str) -> String {
+    let head = op.split(" | ").next().unwrap_or(op);
+    let word = head.split(' ').next().unwrap_or("");
+    if matches!(word, "draw" | "indexed" | "mesh")
+        && let Some(t) = head.find("targets [")
+    {
+        let rest = &head[t..];
+        let end = rest.find("] depth").map_or(rest.len(), |e| e + 1);
+        let targets = strip_pointers(&rest[..end]);
+        let depth = rest.get(end..).and_then(|d| d.strip_prefix(" depth ")).map_or(String::new(), |d| {
+            let d = d.split(" state").next().unwrap_or(d);
+            strip_pointers(d)
+        });
+        return format!("draw {targets} depth {depth}");
+    }
+    head.split(' ').take(2).collect::<Vec<_>>().join(" ")
+}
+
+/// `text` without the pointers in it: `"0x148e1aff560 2560x1440 f10"` becomes `"2560x1440 f10"`.
+fn strip_pointers(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find("0x") {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i + 2..];
+        let n = tail.find(|c: char| !c.is_ascii_hexdigit()).unwrap_or(tail.len());
+        // a pointer is a long hex run; short ones stay
+        if n >= 8 {
+            rest = tail[n..].strip_prefix(' ').unwrap_or(&tail[n..]);
+        } else {
+            out.push_str("0x");
+            rest = tail;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// A command took `ms` on the card (timing run). `op` is its note: the
 /// kind and size first, then the pipeline in brackets, then what it binds.
 pub(crate) fn command_took(op: &str, ms: f64) {
     let us = (ms * 1e3) as u64;
+    {
+        let mut by = COMMANDS_BY_PASS.lock().unwrap_or_else(|e| e.into_inner());
+        let e = by.get_or_insert_with(HashMap::new).entry(pass_key(op)).or_insert((0, 0, 0));
+        e.0 += 1;
+        e.1 += us;
+        e.2 = e.2.max(us);
+    }
     let mut by = COMMANDS_BY_WORK.lock().unwrap_or_else(|e| e.into_inner());
     let e = by.get_or_insert_with(HashMap::new).entry(command_key(op)).or_insert((0, 0, 0));
     e.0 += 1;
@@ -792,6 +844,21 @@ fn log_memory() {
         let [textures, staging] = crate::pool::memory();
         tracing::info!("memory in blocks (VICTORY_TEXTURE_POOL=0 turns them off): {textures} MB of textures, {staging} MB of their staging buffers");
     }
+    for (i, row) in crate::shadow::window_ages().iter().enumerate() {
+        let name = ["under 2 s", "2-10 s", "10-30 s", "30-120 s", "over 120 s"][i];
+        tracing::info!(
+            "windows outside buffers by time since last asked, {name}: held by nothing {} ({:.0} MB), by a list or pass {} ({:.0} MB), only by a descriptor slot {} ({:.0} MB)",
+            row[0].0,
+            mb(row[0].1),
+            row[1].0,
+            mb(row[1].1),
+            row[2].0,
+            mb(row[2].1)
+        );
+    }
+    for (shape, n, bytes, twins) in crate::resource::census_shapes().into_iter().take(24) {
+        tracing::info!("memory by texture shape: {n} x {shape}: {:.1} MB (twins {:.1} MB)", mb(bytes), mb(twins));
+    }
     let targets = crate::resource::targets_census();
     tracing::info!(
         "host copies the sweep never lets go: {} the host renders to or writes {:.0} MB ({} of them placed {:.0} MB);          of them {} have title memory that is not mapped now {:.0} MB, {} were not used for 30 s and are held by no          list and no slot {:.0} MB, {} are both {:.0} MB; and {} copies of textures the title fills that the host          copied into {:.0} MB",
@@ -1307,6 +1374,19 @@ pub(crate) fn log(frames: f64) {
             n as f64 / frames,
             what.chars().take(700).collect::<String>()
         );
+    }
+    {
+        let by = COMMANDS_BY_PASS.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let mut by: Vec<_> = by.into_iter().flatten().collect();
+        by.sort_by_key(|&(_, (_, us, _))| std::cmp::Reverse(us));
+        for (what, (n, us, longest)) in by.into_iter().take(25) {
+            tracing::info!(
+                "  the card's time by pass (timing run): {:.2} ms a frame in {:.1} commands a frame, the longest {:.2} ms: {what}",
+                us as f64 / 1e3 / frames,
+                n as f64 / frames,
+                longest as f64 / 1e3
+            );
+        }
     }
     let by = COMMANDS_BY_WORK.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut by: Vec<_> = by.into_iter().flatten().collect();

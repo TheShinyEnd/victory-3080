@@ -2383,6 +2383,40 @@ pub(crate) fn census() -> [u64; 10] {
     count
 }
 
+/// For the memory report: the host copies alive by shape (size, layers,
+/// format, levels, flags, and whether the title fills them), as (shape,
+/// count, bytes, bytes of twins), the largest first.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn census_shapes() -> Vec<(String, u64, u64, u64)> {
+    let mut by: std::collections::HashMap<String, (u64, u64, u64)> = std::collections::HashMap::new();
+    let all = textures();
+    for &at in all.iter() {
+        // SAFETY: as in `census`.
+        let r = unsafe { &*(at as *const Resource) };
+        let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((host, twin)) = made.as_ref() else { continue };
+        let d = &r.desc;
+        let key = format!(
+            "{}x{}x{} f{} m{} flags {:#x} samples {} {}",
+            d.width,
+            d.height,
+            d.depth_or_array_size,
+            d.format,
+            d.mip_levels,
+            d.flags,
+            d.sample_count,
+            if host.filled { "title-filled" } else { "host-rendered" }
+        );
+        let e = by.entry(key).or_default();
+        e.0 += 1;
+        e.1 += host.bytes;
+        e.2 += twin.as_ref().map_or(0, |t| t.colour.bytes);
+    }
+    let mut v: Vec<_> = by.into_iter().map(|(k, (n, b, t))| (k, n, b, t)).collect();
+    v.sort_by_key(|x| std::cmp::Reverse(x.2 + x.3));
+    v
+}
+
 /// Host textures alive (the title's and the twins) and the bytes the host
 /// gives them, for the memory line.
 #[cfg(windows)]

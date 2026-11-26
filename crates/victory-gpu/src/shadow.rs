@@ -2797,6 +2797,37 @@ pub(crate) fn window_use() -> [u64; 8] {
     out
 }
 
+/// For the memory report: the windows alive by how long ago they were last
+/// asked for (under 2 s, 10 s, 30 s, 120 s, over) and by what holds them
+/// (nothing, a list or pass, or only a descriptor slot): as `[bucket][holder]`
+/// = (windows, bytes).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn window_ages() -> [[(u64, u64); 3]; 5] {
+    let mut out = [[(0u64, 0u64); 3]; 5];
+    let now = crate::host::moment() & 0xffff_ffff;
+    let loose = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+    for s in loose.values() {
+        let tenths = now.saturating_sub(s.used.load(Ordering::Relaxed) & 0xffff_ffff);
+        let b = match tenths {
+            0..20 => 0,
+            20..100 => 1,
+            100..300 => 2,
+            300..1200 => 3,
+            _ => 4,
+        };
+        let h = if Arc::strong_count(s) > 1 {
+            1
+        } else if crate::host::references(&s.buffer) > 1 {
+            2
+        } else {
+            0
+        };
+        out[b][h].0 += 1;
+        out[b][h].1 += s.len;
+    }
+    out
+}
+
 /// Lets go of the copies of windows outside buffers that nothing names any
 /// more. They were never freed, and the world's streaming keeps asking for
 /// new ones: 648 windows (2.8 GB) when the cutscene began, 974 (4.3 GB)
@@ -2820,7 +2851,21 @@ pub(crate) fn let_go_idle() {
         if map.is_empty() {
             return;
         }
-        let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+        // `VICTORY_WINDOW_IDLE_SECS` (default 30, adapted from upstream
+        // PR 3078; 0: only the RAM rule): with plenty of free RAM the rule
+        // below keeps an idle window five minutes, and a world run held
+        // 1,192 of them (5 GB) of which 275 (1.2 GB) were held by nothing
+        // and idle 30 s or more. The holder checks below are unchanged: a
+        // window a list, pass or slot still names stays. The next ask for
+        // a gone window copies it again.
+        static CAP_SECS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let cap = *CAP_SECS.get_or_init(|| {
+            std::env::var("VICTORY_WINDOW_IDLE_SECS").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(30)
+        });
+        let mut idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+        if cap > 0 {
+            idle_ms = idle_ms.min(cap * 1000);
+        }
         let idle: Vec<(u64, u64)> = map
             .iter()
             .filter(|(_, s)| {
