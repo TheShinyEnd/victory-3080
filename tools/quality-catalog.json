@@ -354,6 +354,25 @@
    "cost": "Free"
   },
   {
+   "key": "ambient_magenta",
+   "env": "VICTORY_AMBIENT_MAGENTA",
+   "group": "Lighting & ray tracing",
+   "kind": "bool",
+   "words": [],
+   "min": 0,
+   "max": 0,
+   "presets": [
+    "1",
+    "1",
+    "1",
+    "1"
+   ],
+   "live": false,
+   "needs_hooks": false,
+   "help": "Stand-in light: the title's own light that is strongly magenta (green under half of red and blue) is taken as stale probe memory and replaced by the estimate (Vice-Tay 1bf62e1 / Belobug 81ebb7bd). On by default (0: off). Needs the ambient stand-in on; read at start.",
+   "cost": "Free; also drops real magenta light (neon) the title wrote"
+  },
+  {
    "key": "nan_scrub",
    "env": "VICTORY_NAN_SCRUB",
    "group": "Lighting & ray tracing",
@@ -431,6 +450,88 @@
    "needs_hooks": false,
    "help": "Top mips of a host copy bigger than this are dropped (0: none; empty: the build's default: 8-64 MB by card at 7c0cdf6, off at 28d8475 because a cap banded the picture). Higher keeps more close-up detail.",
    "cost": "Higher costs video memory (and can spill into PC RAM on small cards); lower fits small cards"
+  },
+  {
+   "key": "tiles_small_when_full_mb",
+   "env": "VICTORY_TILES_SMALL_WHEN_FULL_MB",
+   "group": "Textures & memory",
+   "kind": "num",
+   "words": [],
+   "min": 0.0,
+   "max": 1024.0,
+   "presets": [
+    "",
+    "",
+    "",
+    ""
+   ],
+   "live": false,
+   "needs_hooks": false,
+   "help": "With levels-on-demand textures (VICTORY_LEVELS_ON_DEMAND=1) on a full card: the smallest levels of a texture get tiles anyway, up to this many MB in all, so it shows blurred instead of black until its large levels fit (0: off).",
+   "cost": "Costs up to this much card memory; large levels still wait for room"
+  },
+  {
+   "key": "texture_free_unmapped",
+   "env": "VICTORY_TEXTURE_FREE_UNMAPPED",
+   "group": "Textures & memory",
+   "kind": "bool",
+   "words": [],
+   "min": 0,
+   "max": 0,
+   "presets": [
+    "",
+    "",
+    "",
+    ""
+   ],
+   "live": false,
+   "needs_hooks": false,
+   "help": "Lets go of the host copy of a placed texture at once when the title remaps its memory (instead of after the idle time), when nothing shows it.",
+   "cost": "Frees card memory sooner; a copy still needed is made again (upload)"
+  },
+  {
+   "key": "page_writes",
+   "env": "VICTORY_PAGE_WRITES",
+   "group": "Textures & memory",
+   "kind": "choice",
+   "words": [
+    "default",
+    "textures",
+    "all",
+    "slots",
+    "off"
+   ],
+   "min": 0,
+   "max": 0,
+   "presets": [
+    "default",
+    "default",
+    "default",
+    "default"
+   ],
+   "live": false,
+   "needs_hooks": false,
+   "help": "What is done when a DirectStorage write or a finished plain read lands bytes under placed textures. default: open the guarded blocks. textures: also make the placed textures under it due again, plain reads too (fxceless e4245f3; for black or garbled faces in the opening cutscene). all: everything. slots: slots only. off: count only.",
+   "cost": "textures re-uploads textures that were uploaded before their data landed"
+  },
+  {
+   "key": "place_common",
+   "env": "VICTORY_PLACE_COMMON",
+   "group": "Advanced / diagnostics",
+   "kind": "bool",
+   "words": [],
+   "min": 0,
+   "max": 0,
+   "presets": [
+    "",
+    "",
+    "",
+    ""
+   ],
+   "live": false,
+   "needs_hooks": false,
+   "help": "Host copies go back to the COMMON state after a placed copy (VIctory-RTX 50347f8), so a later copy or shader read never finds COPY_DEST.",
+   "cost": "Free (a barrier per placed copy)"
   },
   {
    "key": "residency_reserve_mb",
@@ -549,6 +650,44 @@
    "needs_hooks": false,
    "help": "Upload textures ahead of the draw lists that use them (less pop-in).",
    "cost": "Slightly less hitching"
+  },
+  {
+   "key": "bury_aside",
+   "env": "VICTORY_BURY_ASIDE",
+   "group": "Performance",
+   "kind": "bool",
+   "words": [],
+   "min": 0,
+   "max": 0,
+   "presets": [
+    "",
+    "",
+    "",
+    ""
+   ],
+   "live": false,
+   "needs_hooks": false,
+   "help": "Retired host objects are dropped by a helper thread instead of the thread that lands flights (playablegames-peppa 92b7cf9).",
+   "cost": "Not measured on this machine: may save a few ms of that thread's time"
+  },
+  {
+   "key": "land_aside",
+   "env": "VICTORY_LAND_ASIDE",
+   "group": "Performance",
+   "kind": "bool",
+   "words": [],
+   "min": 0,
+   "max": 0,
+   "presets": [
+    "",
+    "",
+    "",
+    ""
+   ],
+   "live": false,
+   "needs_hooks": false,
+   "help": "Landed lists are reset by a helper thread after a submission instead of the submitting thread (playablegames-peppa cb41295).",
+   "cost": "Not measured on this machine: may save 2-4 ms of the submitting thread"
   },
   {
    "key": "relay",
@@ -845,6 +984,85 @@
    "needs_hooks": false,
    "help": "EXPERIMENTAL: builds the ray-tracing structures. Cannot run on NVIDIA cards (64-lane programs refused).",
    "cost": "Large cost; may hang"
+  },
+  {
+   "key": "mnk",
+   "env": "VICTORY_MNK",
+   "group": "Advanced / diagnostics",
+   "kind": "bool",
+   "words": [],
+   "min": 0,
+   "max": 0,
+   "presets": [
+    "1",
+    "1",
+    "1",
+    "1"
+   ],
+   "live": false,
+   "needs_hooks": false,
+   "help": "Mouse and keyboard as a gamepad: the mouse is the right stick (the cursor is hidden and held at the window's centre while the game is in front), keys per bindings.ini. Unset with scripted keys (VICTORY_KEYS*): off.",
+   "cost": "None"
+  },
+  {
+   "key": "mnk_bindings",
+   "env": "VICTORY_MNK_BINDINGS",
+   "group": "Advanced / diagnostics",
+   "kind": "text",
+   "words": [],
+   "min": 0,
+   "max": 0,
+   "presets": [
+    "",
+    "",
+    "",
+    ""
+   ],
+   "live": false,
+   "needs_hooks": false,
+   "help": "Path of a bindings file (copy bindings.ini and edit: Sensitivity, key per button). Empty: the built-in profile.",
+   "cost": "None"
+  },
+  {
+   "key": "gamepad_mouse",
+   "env": "VICTORY_GAMEPAD_MOUSE",
+   "group": "Advanced / diagnostics",
+   "kind": "bool",
+   "words": [],
+   "min": 0,
+   "max": 0,
+   "presets": [
+    "1",
+    "1",
+    "1",
+    "1"
+   ],
+   "live": false,
+   "needs_hooks": false,
+   "help": "A real GameInput mouse device the game polls itself (cursor motion inside the window, three buttons; vnvidia 12b1d16). The cursor is put back to the window's centre when it leaves the middle half, so a sweep does not stop at the edge.",
+   "cost": "None"
+  },
+  {
+   "key": "mnk_mouse",
+   "env": "VICTORY_MNK_MOUSE",
+   "group": "Advanced / diagnostics",
+   "kind": "choice",
+   "words": [
+    "device",
+    "stick"
+   ],
+   "min": 0,
+   "max": 0,
+   "presets": [
+    "device",
+    "device",
+    "device",
+    "device"
+   ],
+   "live": false,
+   "needs_hooks": false,
+   "help": "device: the mouse is the GameInput mouse above. stick: the mouse look is the right stick of the keyboard's stand-in pad instead (ItsMK1's way; the game then has no mouse device).",
+   "cost": "None"
   },
   {
    "key": "f16_nearest",

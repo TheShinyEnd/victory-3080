@@ -46,6 +46,10 @@ pub(crate) struct Pending {
     screen: bool,
     /// Confirmed first-scene / bake producer prepared early even on a cold cache.
     scene_input: bool,
+    /// One-time data initialization (head blendshape mappings kept for the run):
+    /// finished before its first dispatch, not within the frame's wait budget
+    /// (cool_fox/Xyzstk 700fc78).
+    required_initialization: bool,
     /// Why this pipeline is intentionally skipped (e.g. RT resolve without BVH).
     left_out: Option<&'static str>,
     /// LOCAL: how long draws have waited for it so far, in microseconds
@@ -63,6 +67,13 @@ fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
     shaders
         .iter()
         .any(|s| s.stage == "compute" && s.container.windows(name.len()).any(|w| w == name))
+}
+
+/// This producer writes head mappings retained for the run. Losing its first
+/// dispatch leaves later skinning reading uninitialized data even after the
+/// compiler queue has drained.
+fn required_initialization(shaders: &[Arc<Shader>]) -> bool {
+    named(shaders, b"CS_ComputeBlendshapeMappings")
 }
 
 fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
@@ -123,7 +134,8 @@ impl Pending {
             key.update(s.hash.as_bytes());
         }
         key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
-        let scene_input = scene_input(&shaders);
+        let required_initialization = required_initialization(&shaders);
+        let scene_input = required_initialization || scene_input(&shaders);
         let screen = (graphics.as_ref().is_some_and(|g| g.screen_pass())
             && shaders.iter().all(|s| s.stage != "mesh"))
             || scene_input;
@@ -131,6 +143,7 @@ impl Pending {
         Pending {
             screen,
             scene_input,
+            required_initialization,
             left_out,
             formats: graphics.as_ref().map_or([0; 9], |g| g.formats()),
             variant: OnceLock::new(),
@@ -332,7 +345,14 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     if p.made.get().is_none() {
         let _p = victory_core::prof_scope!("pipe.request");
         start(p, REQUESTED);
-        wait(p, crate::frame::current());
+        if p.required_initialization {
+            // OnceLock waits for a worker already compiling this pipeline, or
+            // compiles it here: the shared frame budget (and the cap on waits for
+            // new pipelines) cannot discard a one-time write.
+            p.make();
+        } else {
+            wait(p, crate::frame::current());
+        }
     }
     p.made.get()?.as_ref()
 }

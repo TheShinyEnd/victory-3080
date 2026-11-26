@@ -275,6 +275,18 @@ extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    // Mouse and keyboard profile on: no cursor over the game's window while
+    // it is in front (the mouse is the right stick).
+    if message == wm::WM_SETCURSOR
+        && (lparam as u16) == wm::HTCLIENT as u16
+        && super::gameinput::mnk::enabled()
+        // SAFETY: a plain query.
+        && unsafe { wm::GetForegroundWindow() } == hwnd
+    {
+        // SAFETY: no cursor is allowed.
+        unsafe { wm::SetCursor(std::ptr::null_mut()) };
+        return 1;
+    }
     // A user close (close button, Alt+F4, window or taskbar menu); a
     // console title never sees one, nor a WM_CLOSE from it.
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_CLOSE as usize {

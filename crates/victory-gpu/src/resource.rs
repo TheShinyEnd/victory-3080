@@ -1449,7 +1449,36 @@ static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
 /// `VICTORY_ALIAS_COPY=0`: none is found, as before; `=1`: only textures
 /// of one level and one layer, as at first.
 #[cfg(windows)]
-pub(crate) fn alias_of(this: This) -> Option<This> {
+pub(crate) fn alias_of(this: This) -> Option<Held> {
+    // Pinned under the table's lock (fxceless a463dcb): once it is let go the
+    // title can drop its last reference, and the caller's alias copy still
+    // needs the texture.
+    alias_source(this, true).map(Held)
+}
+
+/// A title texture kept alive by one more reference ([`alias_of`]); the
+/// last reference frees it.
+#[cfg(windows)]
+pub(crate) struct Held(This);
+
+#[cfg(windows)]
+impl Held {
+    /// The texture the handle keeps alive.
+    pub(crate) fn get(&self) -> This {
+        self.0
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Held {
+    fn drop(&mut self) {
+        object::release_boxed::<Resource>(self.0);
+    }
+}
+
+/// [`alias_of`]'s lookup; `pin`: with a reference added under the lock.
+#[cfg(windows)]
+fn alias_source(this: This, pin: bool) -> Option<This> {
     use std::sync::atomic::Ordering::Relaxed;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if this.is_null()
@@ -1510,7 +1539,10 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
             );
         }
     }
-    same.then_some(other)
+    if !same || (pin && !object::add_ref_alive(other)) {
+        return None;
+    }
+    Some(other)
 }
 
 /// Whether host copies are made on first use. On by default;
@@ -1612,7 +1644,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         // The levels views show ([`held_only`]), those of the slots shaders
         // pick by index among them.
         let mut base = 0;
-        if shape_fits && r.host.placed.load(Relaxed) && held_only() && alias_of(this).is_none() {
+        if shape_fits && r.host.placed.load(Relaxed) && held_only() && alias_source(this, false).is_none() {
             let wanted = r.host.wanted.load(Relaxed);
             let viewed = crate::descriptor::host::first_viewed(r.data() as u64).unwrap_or(u32::MAX);
             let first = wanted.min(viewed);
@@ -2106,6 +2138,168 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
     }
 }
 
+// ---------------------------------------------------------------------------
+// Host copies of placed textures whose title memory was remapped
+// (`VICTORY_TEXTURE_FREE_UNMAPPED=1`, off by default).
+//
+// From ad3lre/victory-8gb-pre-cool-fox 150ba23 (and the commit before it,
+// which keeps the ranges), adapted. The title maps and unmaps memory
+// thousands of times a second while it loads, so `note_unmapped` only
+// records the range (a lock and a merge over at most `KEPT_RANGES` ranges);
+// `free_unmapped`, called once a frame from `let_go_idle`, then lets go of
+// the host copies of placed textures filled from there at once, not after
+// the idle time. The conditions for letting a copy go are those of the idle
+// sweep (the resource alone holds the host texture: no list, no slot), so
+// a texture something still shows keeps its copy; the next use makes the
+// copy anew from title memory.
+// ---------------------------------------------------------------------------
+
+/// Whether `VICTORY_TEXTURE_FREE_UNMAPPED=1`.
+#[cfg(windows)]
+fn free_unmapped_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_FREE_UNMAPPED").is_some_and(|v| v == "1"))
+}
+
+/// Sorted, non-overlapping, non-adjacent `(start, len)` ranges; `all`: more
+/// arrived than [`KEPT_RANGES`], every placed texture is taken as due.
+#[cfg(windows)]
+#[derive(Default)]
+struct Unmapped {
+    ranges: Vec<(u64, u64)>,
+    all: bool,
+}
+
+#[cfg(windows)]
+const KEPT_RANGES: usize = 64;
+
+#[cfg(windows)]
+static UNMAPPED: std::sync::Mutex<Unmapped> = std::sync::Mutex::new(Unmapped { ranges: Vec::new(), all: false });
+
+/// Host copies let go for their source's sake since the start.
+#[cfg(windows)]
+static FREED_UNMAPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether two half-open byte ranges share a byte.
+#[cfg(windows)]
+fn ranges_overlap(a_start: u64, a_len: u64, b_start: u64, b_len: u64) -> bool {
+    a_len != 0
+        && b_len != 0
+        && a_start < b_start.saturating_add(b_len)
+        && b_start < a_start.saturating_add(a_len)
+}
+
+/// Records that title memory `[base, base + len)` was remapped
+/// (`crate::title_memory_remapped`). Nothing with the switch off.
+#[cfg(windows)]
+pub(crate) fn note_unmapped(base: u64, len: u64) {
+    if len == 0 || !free_unmapped_on() {
+        return;
+    }
+    let mut u = UNMAPPED.lock().unwrap_or_else(|e| e.into_inner());
+    if u.all {
+        return;
+    }
+    if merge_into(&mut u.ranges, base, len) {
+        u.all = true;
+        u.ranges = Vec::new();
+    }
+}
+
+/// Puts `[base, base + len)` into the sorted, merged `ranges`; true if the
+/// list is full and the caller must treat everything as due.
+#[cfg(windows)]
+fn merge_into(ranges: &mut Vec<(u64, u64)>, base: u64, len: u64) -> bool {
+    if ranges.len() >= KEPT_RANGES {
+        return true;
+    }
+    let mut out = Vec::with_capacity(ranges.len() + 1);
+    let (mut start, mut end) = (base, base.saturating_add(len));
+    let mut put = false;
+    for &(b_start, b_len) in ranges.iter() {
+        let b_end = b_start.saturating_add(b_len);
+        if b_end < start {
+            out.push((b_start, b_len));
+        } else if b_start > end {
+            if !put {
+                out.push((start, end - start));
+                put = true;
+            }
+            out.push((b_start, b_len));
+        } else {
+            start = start.min(b_start);
+            end = end.max(b_end);
+        }
+    }
+    if !put {
+        out.push((start, end - start));
+    }
+    *ranges = out;
+    false
+}
+
+/// Lets go of the host copies of placed textures filled from memory the
+/// title remapped since the last call. Called by `let_go_idle`.
+#[cfg(windows)]
+fn free_unmapped() {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !free_unmapped_on() {
+        return;
+    }
+    let taken = std::mem::take(&mut *UNMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
+    if !taken.all && taken.ranges.is_empty() {
+        return;
+    }
+    let (mut went, mut bytes) = (0u64, 0u64);
+    let all = textures();
+    for &at in all.iter() {
+        // SAFETY: a texture leaves the table before it is freed, under the
+        // lock held here (`Drop for Resource`).
+        let r = unsafe { &*(at as *const Resource) };
+        if !r.host.placed.load(Relaxed) || !fills(&r.desc) || crate::texture::host_wrote(at) {
+            continue;
+        }
+        if !taken.all {
+            let size = footprint(&r.desc).map_or(0, |f| f.size);
+            let start = r.data() as u64;
+            if !taken.ranges.iter().any(|&(s, l)| ranges_overlap(start, size, s, l)) {
+                continue;
+            }
+        }
+        let gone = {
+            let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+            let free = made.as_ref().is_some_and(|(host, _)| {
+                std::sync::Arc::strong_count(host) == 1 && crate::host::references(&host.texture) == 1
+            });
+            if free {
+                // Under the lock, as the idle sweep does.
+                crate::texture::unstage(at as This);
+                r.host.wanted.store(u32::MAX, Relaxed);
+                made.take()
+            } else {
+                None
+            }
+        };
+        if let Some((host, _)) = gone {
+            r.host.gone.store(true, Relaxed);
+            KINDS[2].fetch_add(1, Relaxed);
+            KINDS[3].fetch_add(host.bytes, Relaxed);
+            went += 1;
+            bytes += host.bytes;
+            crate::host::retire(host);
+        }
+    }
+    if went > 0 {
+        let total = FREED_UNMAPPED.fetch_add(went, Relaxed) + went;
+        tracing::info!(
+            went,
+            mb = bytes >> 20,
+            total,
+            "residency: host copies of placed textures let go because the title remapped their memory (VICTORY_TEXTURE_FREE_UNMAPPED=1)"
+        );
+    }
+}
+
 /// Lets go of the host copies of textures the title fills that nothing
 /// names any more: placed textures were never released (one host texture
 /// per address and description ever viewed: 18,639 of them, 2.5 GB, after
@@ -2137,6 +2331,8 @@ pub(crate) fn let_go_idle() {
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
         return;
     }
+    // The copies whose title memory was remapped (off unless asked for).
+    free_unmapped();
     // Copies replaced by ones with more levels, as any let go.
     {
         let mut replaced = REPLACED.lock().unwrap_or_else(|e| e.into_inner());

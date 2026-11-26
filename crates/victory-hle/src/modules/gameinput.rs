@@ -30,6 +30,7 @@ const E_NOINTERFACE: HRESULT = 0x8000_4002_u32 as i32;
 
 /// Input kinds (bits) our devices have.
 const KEYBOARD_KIND: u32 = 0x10;
+const MOUSE_KIND: u32 = 0x20;
 const GAMEPAD_KIND: u32 = 0x4_0000;
 /// Device status of a connected device: connected, input enabled.
 const STATUS_CONNECTED: u32 = 0x3;
@@ -51,11 +52,18 @@ const RIGHT_SHOULDER: u32 = 0x800;
 const LEFT_STICK: u32 = 0x1000;
 const RIGHT_STICK: u32 = 0x2000;
 
+/// Mouse and keyboard as a pad (`VICTORY_MNK`; ItsMK1/VIctory-MnK-patches).
+#[cfg(windows)]
+#[path = "mnk.rs"]
+pub(super) mod mnk;
+
 /// Devices: host pad slots, the keyboard's stand-in pad, the keyboard.
 const PADS: usize = 4;
 const FALLBACK: usize = PADS;
 const KEYBOARD: usize = PADS + 1;
-const DEVICES: usize = PADS + 2;
+/// A mouse while our window is in front (`VICTORY_GAMEPAD_MOUSE`).
+const MOUSE: usize = PADS + 2;
+const DEVICES: usize = MOUSE + 1;
 
 /// Readings kept per device for next/previous lookups.
 const HISTORY: usize = 256;
@@ -105,18 +113,67 @@ struct KeyState {
 
 const _: () = assert!(size_of::<KeyState>() == 12 && size_of::<PadState>() == 28);
 
+/// GameInput v0 reports cumulative relative motion. Scroll axes stay at zero.
+/// (A mouse device after vnvidia 12b1d16, superboynick.)
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct MouseState {
+    buttons: u32,
+    position_x: i64,
+    position_y: i64,
+    wheel_x: i64,
+    wheel_y: i64,
+}
+const _: () = assert!(size_of::<MouseState>() == 40);
+
+/// The next cursor reference and the motion since the previous focused sample.
+#[cfg(any(windows, test))]
+fn mouse_delta(
+    previous: Option<(i32, i32)>,
+    position: Option<(i32, i32)>,
+    size: (i32, i32),
+) -> (Option<(i32, i32)>, (i64, i64)) {
+    let current = position
+        .filter(|_| size.0 > 0 && size.1 > 0)
+        .map(|(x, y)| (x.clamp(0, size.0 - 1), y.clamp(0, size.1 - 1)));
+    let delta = match (previous, current) {
+        (Some((x, y)), Some((nx, ny))) => (i64::from(nx) - i64::from(x), i64::from(ny) - i64::from(y)),
+        _ => (0, 0),
+    };
+    (current, delta)
+}
+
 /// Host input, or a fake in tests.
 trait Source: Send {
     /// The pad in host slot `slot`, `None` when the slot is empty.
     fn pad(&mut self, slot: usize) -> Option<PadState>;
     /// Keys held down; none while the title's window lacks focus.
     fn keys(&mut self) -> Vec<KeyState>;
+    /// The mouse, `None` while there is none (focus elsewhere, or off).
+    fn mouse(&mut self) -> Option<MouseState> {
+        None
+    }
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
 }
 
 fn fallback(keys: &[KeyState]) -> PadState {
-    let on = |vk: u8| {
+    // With the mouse and keyboard profile: it takes the held keys; the
+    // scripted ones (test harness) still go through the stand-in's table.
+    #[cfg(all(windows, not(test)))]
+    if mnk::enabled() {
+        let scripted: Vec<KeyState> = host::scripted_keys()
+            .into_iter()
+            .map(|virtual_key| KeyState { virtual_key, ..Default::default() })
+            .collect();
+        return merged(mnk::sample().unwrap_or_default(), fallback_table(&scripted));
+    }
+    fallback_table(keys)
+}
+
+/// The stand-in pad's table (`FALLBACK_BUTTONS`) applied to the keys held.
+fn fallback_table(keys: &[KeyState]) -> PadState {
+    let on =|vk: u8| {
         if keys.iter().any(|k| k.virtual_key == vk) {
             1.0
         } else {
@@ -210,10 +267,10 @@ struct DeviceInfo {
 const _: () = assert!(std::mem::offset_of!(DeviceInfo, id) == 0x20);
 
 fn kind(index: usize) -> u32 {
-    if index == KEYBOARD {
-        KEYBOARD_KIND
-    } else {
-        GAMEPAD_KIND
+    match index {
+        KEYBOARD => KEYBOARD_KIND,
+        MOUSE => MOUSE_KIND,
+        _ => GAMEPAD_KIND,
     }
 }
 
@@ -249,6 +306,7 @@ impl Device {
 enum Value {
     Pad(PadState),
     Keys(Vec<KeyState>),
+    Mouse(MouseState),
 }
 
 #[repr(C)]
@@ -266,6 +324,7 @@ impl Reading {
         match self.value {
             Value::Pad(_) => GAMEPAD_KIND,
             Value::Keys(_) => KEYBOARD_KIND,
+            Value::Mouse(_) => MOUSE_KIND,
         }
     }
 }
@@ -430,12 +489,12 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys) = {
+        let (pads, keys, mouse) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            (pads, source.keys())
+            (pads, source.keys(), source.mouse())
         };
-        let events = self.state().poll(&self.devices, self.one_pad, pads, keys);
+        let events = self.state().poll(&self.devices, self.one_pad, pads, keys, mouse);
         self.deliver(events);
     }
 
@@ -481,9 +540,11 @@ impl State {
         one_pad: bool,
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        mouse: Option<MouseState>,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
+        self.update(devices, MOUSE, mouse.map(Value::Mouse), now, &mut events);
         if one_pad {
             let pad = pads.into_iter().flatten().fold(fallback(&keys), merged);
             self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events);
@@ -530,7 +591,10 @@ impl State {
             }));
         }
         if was != slot.connected {
-            tracing::info!(device = index, connected = !was, "input device");
+            tracing::info!(device = index, kind = kind(index), connected = !was, "input device");
+            if index == MOUSE && !slot.connected {
+                slot.history.clear();
+            }
             let (current, previous) = if was {
                 (0, STATUS_CONNECTED)
             } else {
@@ -881,7 +945,10 @@ extern "system" fn find_by_id(this: This, id: *const [u8; 32], out: Out) -> HRES
     }
     // SAFETY: checked non-null; the title passes a device id.
     let id = unsafe { &*id };
-    match hub(this).devices.iter().find(|d| d.info.id == *id) {
+    let hub = hub(this);
+    match hub.devices.iter().find(|d| {
+        d.info.id == *id && (d.index != MOUSE || hub.state().slots[MOUSE].connected)
+    }) {
         Some(device) => {
             // SAFETY: checked non-null.
             unsafe { out.write((device as *const Device).cast()) };
@@ -1044,7 +1111,7 @@ extern "system" fn reading_device(this: *const Reading, out: *mut *const Device)
 extern "system" fn key_count(this: *const Reading) -> u32 {
     match &reading(this).value {
         Value::Keys(keys) => keys.len() as u32,
-        Value::Pad(_) => 0,
+        _ => 0,
     }
 }
 extern "system" fn key_state(this: *const Reading, count: u32, out: *mut KeyState) -> u32 {
@@ -1063,6 +1130,16 @@ extern "system" fn gamepad_state(this: *const Reading, out: *mut PadState) -> bo
     match &reading(this).value {
         Value::Pad(state) if !out.is_null() => {
             // SAFETY: checked non-null.
+            unsafe { out.write(*state) };
+            true
+        }
+        _ => false,
+    }
+}
+extern "system" fn mouse_state(this: *const Reading, out: *mut MouseState) -> bool {
+    match &reading(this).value {
+        Value::Mouse(state) if !out.is_null() => {
+            // SAFETY: the caller supplies room for the v0 state.
             unsafe { out.write(*state) };
             true
         }
@@ -1091,7 +1168,7 @@ static READING: Table<25> = Table([
     nothing as *const (),           // 0x68
     key_count as *const (),         // 0x70
     key_state as *const (),         // 0x78
-    nothing as *const (),           // 0x80 mouse
+    mouse_state as *const (),       // 0x80 mouse
     nothing as *const (),           // 0x88 touch
     nothing as *const (),           // 0x90
     nothing as *const (),           // 0x98 motion
@@ -1119,9 +1196,11 @@ pub(crate) fn module() -> HleModule {
 mod host {
     use std::time::{Duration, Instant};
 
+    use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
+    use windows_sys::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        GetAsyncKeyState, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW,
+        GetAsyncKeyState, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON,
     };
     use windows_sys::Win32::UI::Input::XboxController::{
         XINPUT_GAMEPAD, XINPUT_GAMEPAD_A, XINPUT_GAMEPAD_B, XINPUT_GAMEPAD_BACK,
@@ -1132,7 +1211,7 @@ mod host {
         XInputSetState,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetWindowThreadProcessId,
+        GetClientRect, GetCursorPos, GetForegroundWindow, GetWindowThreadProcessId, SetCursorPos,
     };
 
     use super::*;
@@ -1177,6 +1256,8 @@ mod host {
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        previous_cursor: Option<(i32, i32)>,
+        mouse: MouseState,
     }
 
     impl Source for Host {
@@ -1229,6 +1310,63 @@ mod host {
                     ..Default::default()
                 })
                 .collect()
+        }
+
+        /// A mouse device while our window is in front: the cursor's motion
+        /// inside the window and the three buttons (vnvidia 12b1d16,
+        /// superboynick; GPL-3). `VICTORY_GAMEPAD_MOUSE=0`: none, as before
+        /// (also none while `VICTORY_MNK_MOUSE=stick` turns the mouse into
+        /// the right stick). Adaptation: with `VICTORY_GAMEPAD_MOUSE_RECENTER`
+        /// (on by default; 0: off) the cursor is put back to the window's
+        /// centre when it leaves its middle half, without a motion of its own,
+        /// so that a sweep in one direction does not stop at the window's edge.
+        fn mouse(&mut self) -> Option<MouseState> {
+            static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+                std::env::var_os("VICTORY_GAMEPAD_MOUSE").is_none_or(|v| v != "0") && !super::mnk::stick_look()
+            });
+            static RECENTER: LazyLock<bool> =
+                LazyLock::new(|| std::env::var_os("VICTORY_GAMEPAD_MOUSE_RECENTER").is_none_or(|v| v != "0"));
+            if !*ENABLED {
+                return None;
+            }
+            let (mut point, mut rect) = (POINT::default(), RECT::default());
+            let window = focused_window();
+            let position = window.and_then(|window| {
+                // SAFETY: all outputs are local and all coordinates use the same window.
+                let sampled = unsafe {
+                    GetCursorPos(&mut point) != 0
+                        && ScreenToClient(window, &mut point) != 0
+                        && GetClientRect(window, &mut rect) != 0
+                        && GetForegroundWindow() == window
+                };
+                sampled.then_some((point.x, point.y))
+            });
+            let (mut cursor, (dx, dy)) = mouse_delta(self.previous_cursor, position, (rect.right, rect.bottom));
+            if let (Some(window), Some((x, y)), true) = (window, cursor, *RECENTER) {
+                let (w, h) = (rect.right, rect.bottom);
+                if x < w / 4 || x > w - w / 4 || y < h / 4 || y > h - h / 4 {
+                    let mut centre = POINT { x: w / 2, y: h / 2 };
+                    // SAFETY: a local point and the window the cursor was read for.
+                    if unsafe { ClientToScreen(window, &mut centre) != 0 && SetCursorPos(centre.x, centre.y) != 0 } {
+                        cursor = Some((w / 2, h / 2));
+                    }
+                }
+            }
+            self.previous_cursor = cursor;
+            if cursor.is_none() {
+                self.mouse = MouseState::default();
+                return None;
+            }
+            self.mouse.position_x += dx;
+            self.mouse.position_y += dy;
+            self.mouse.buttons = 0;
+            for (bit, vk) in [VK_LBUTTON, VK_RBUTTON, VK_MBUTTON].into_iter().enumerate() {
+                // SAFETY: virtual-key state query.
+                if unsafe { GetAsyncKeyState(i32::from(vk)) } < 0 {
+                    self.mouse.buttons |= 1 << bit;
+                }
+            }
+            Some(self.mouse)
         }
 
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
@@ -1317,13 +1455,24 @@ mod host {
             .collect()
     }
 
+    /// The keys `VICTORY_KEYS*` hold now.
+    pub(super) fn scripted_keys() -> Vec<u8> {
+        scripted()
+    }
+
     /// The foreground window is one of ours (the title's or our fallback).
     fn focused() -> bool {
+        focused_window().is_some()
+    }
+
+    /// The foreground window if it is one of ours.
+    fn focused_window() -> Option<HWND> {
         let mut process = 0;
         // SAFETY: plain queries; a null window gives process 0.
         unsafe {
-            GetWindowThreadProcessId(GetForegroundWindow(), &mut process);
-            process == GetCurrentProcessId()
+            let window = GetForegroundWindow();
+            GetWindowThreadProcessId(window, &mut process);
+            (process == GetCurrentProcessId()).then_some(window)
         }
     }
 
@@ -1364,6 +1513,7 @@ mod tests {
     struct FakeHost {
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        mouse: Option<MouseState>,
         rumble: Vec<(usize, u16, u16)>,
     }
 
@@ -1375,6 +1525,9 @@ mod tests {
         }
         fn keys(&mut self) -> Vec<KeyState> {
             self.0.lock().unwrap().keys.clone()
+        }
+        fn mouse(&mut self) -> Option<MouseState> {
+            self.0.lock().unwrap().mouse
         }
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
             self.0.lock().unwrap().rumble.push((slot, low, high));
@@ -1511,6 +1664,47 @@ mod tests {
     }
 
     #[test]
+    fn mouse_motion_clamps_to_client_and_resets_on_focus_loss() {
+        let mut previous = None;
+        for (point, delta) in [
+            (Some((50, 40)), (0, 0)),
+            (Some((30, 10)), (-20, -30)),
+            (Some((200, -5)), (69, -10)),
+            (Some((201, -8)), (0, 0)),
+            (None, (0, 0)),
+            (Some((7, 9)), (0, 0)),
+        ] {
+            let (cursor, motion) = mouse_delta(previous, point, (100, 80));
+            assert_eq!(motion, delta);
+            previous = cursor;
+        }
+    }
+
+    #[test]
+    fn mouse_readings_and_callbacks_in_both_pad_modes() {
+        for one_pad in [false, true] {
+            let (hub, host) = fake_with(one_pad);
+            let log = Log::default();
+            register(hub, MOUSE_KIND, 2, &log);
+            let sample = MouseState { buttons: 5, position_x: -3, ..Default::default() };
+            host.lock().unwrap().mouse = Some(sample);
+            hub.poll();
+            let r = current(hub, MOUSE_KIND, MOUSE).unwrap();
+            let get = slot::<extern "system" fn(*const Reading, *mut MouseState) -> bool, _>(r, 0x80);
+            let mut got = MouseState::default();
+            assert!(get(r, &mut got));
+            assert_eq!(got, sample);
+            release(r);
+
+            host.lock().unwrap().mouse = None;
+            hub.poll();
+            assert_eq!(current(hub, MOUSE_KIND, MOUSE), Err(DEVICE_DISCONNECTED));
+            assert!(hub.state().slots[MOUSE].history.is_empty());
+            assert_eq!(*log.lock().unwrap(), [(MOUSE, 3, 0), (MOUSE, 0, 3)]);
+        }
+    }
+
+    #[test]
     fn pads_connect_report_and_disconnect() {
         let (hub, host) = fake();
         let log = Log::default();
@@ -1615,7 +1809,7 @@ mod tests {
         assert_eq!(*log.lock().unwrap(), [(FALLBACK, STATUS_CONNECTED, 0)]);
         let pad = |hub: &Hub| match &hub.state().slots[FALLBACK].history.back().unwrap().value {
             Value::Pad(p) => *p,
-            Value::Keys(_) => unreachable!(),
+            _ => unreachable!(),
         };
         host.lock().unwrap().keys = vec![key(b'D')];
         hub.poll();

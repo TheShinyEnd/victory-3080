@@ -518,6 +518,57 @@ fn bury(finished: u64) {
     drop(done);
 }
 
+/// [`bury`] for the thread that lands flights (`Host::relay_land`), with
+/// `VICTORY_BURY_ASIDE=1` (off by default: [`bury`], as before; flips with
+/// the in-run A/B in diagnostics builds): what is done with is taken out of
+/// [`RETIRED`] as [`bury`] takes it (oldest first, [`bury_lag`] behind) and
+/// dropped on a thread of its own (`victory-bury`), not in the landing.
+/// Dropping later is always allowed: these objects only wait for the card
+/// and [`Retired`] is already dropped on whatever thread finishes the
+/// submission. From playablegames-peppa 92b7cf9 (fxceless #1224, Steenax6),
+/// adapted to this tree's single list.
+fn bury_aside(finished: u64) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    static TO: OnceLock<Option<Mutex<std::sync::mpsc::Sender<Vec<(u64, Retired)>>>>> = OnceLock::new();
+    let on = *ON.get_or_init(|| std::env::var_os("VICTORY_BURY_ASIDE").is_some_and(|v| v == "1"));
+    #[cfg(feature = "diagnostics")]
+    let on = crate::ab::pick("VICTORY_BURY_ASIDE").unwrap_or(on);
+    if !on {
+        bury(finished);
+        return;
+    }
+    let finished = finished.saturating_sub(bury_lag());
+    let done: Vec<(u64, Retired)> = {
+        let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+        let n = retired.iter().take_while(|(at, _)| *at <= finished).count();
+        if n == 0 {
+            return;
+        }
+        retired.drain(..n).collect()
+    };
+    let to = TO.get_or_init(|| {
+        let (to, from) = std::sync::mpsc::channel::<Vec<(u64, Retired)>>();
+        std::thread::Builder::new()
+            .name("victory-bury".into())
+            .spawn(move || {
+                for done in from {
+                    drop(done);
+                }
+            })
+            .ok()
+            .map(|_| Mutex::new(to))
+    });
+    match to {
+        // (No thread to take them: dropped here.)
+        Some(to) => {
+            if let Err(e) = to.lock().unwrap_or_else(|e| e.into_inner()).send(done) {
+                drop(e.0);
+            }
+        }
+        None => drop(done),
+    }
+}
+
 /// Objects [`retire`] dropped at once (no submission was running) and
 /// kept until a running submission finished, since the start.
 static RETIREMENTS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
@@ -3310,6 +3361,45 @@ fn land() {
     }
 }
 
+/// [`land`] at the end of a submission, on a thread of its own with
+/// `VICTORY_LAND_ASIDE=1` (off by default; flips with the in-run A/B in
+/// diagnostics builds): resetting the lists of landed flights is the host's
+/// and the driver's work on their allocators, and nothing the next
+/// submission waits for. [`land`] is already called from the thread that
+/// settles flights as well, so it may run beside the submitting thread.
+/// From playablegames-peppa cb41295 (fxceless #1146, beamdotdev).
+fn land_after_submission() {
+    static WANTED: OnceLock<bool> = OnceLock::new();
+    static ASIDE: OnceLock<Option<Mutex<std::sync::mpsc::Sender<()>>>> = OnceLock::new();
+    let wanted = *WANTED.get_or_init(|| std::env::var_os("VICTORY_LAND_ASIDE").is_some_and(|v| v == "1"));
+    #[cfg(feature = "diagnostics")]
+    let wanted = crate::ab::pick("VICTORY_LAND_ASIDE").unwrap_or(wanted);
+    if wanted {
+        let aside = ASIDE.get_or_init(|| {
+            let (send, asked) = std::sync::mpsc::channel::<()>();
+            std::thread::Builder::new()
+                .name("victory-land-aside".to_owned())
+                .spawn(move || {
+                    while asked.recv().is_ok() {
+                        // One landing for all the asks so far.
+                        while asked.try_recv().is_ok() {}
+                        let _landing = crate::timeline::span("landed lists reset and given back");
+                        land();
+                    }
+                })
+                .ok()
+                .map(|_| Mutex::new(send))
+        });
+        if let Some(send) = aside
+            && send.lock().unwrap_or_else(|e| e.into_inner()).send(()).is_ok()
+        {
+            return;
+        }
+    }
+    let _landing = crate::timeline::span("landed lists reset and given back");
+    land();
+}
+
 /// The thread that settles the flights once the card has run them all
 /// ([`late`]): without it a bottom-of-pipe write would reach the title only
 /// at the next call that settles, and a title thread that polls such a
@@ -5196,7 +5286,7 @@ impl Host {
         }
         if last > 0 {
             FINISHED.store(last, Ordering::Release);
-            bury(last);
+            bury_aside(last);
         }
         stage.next("landing: the rest");
         self.log_messages();
@@ -5481,8 +5571,7 @@ impl Host {
             LINE_MOVED.notify_one();
         }
         drop(submitted);
-        let _landing = crate::timeline::span("landed lists reset and given back");
-        land();
+        land_after_submission();
     }
 
     /// Sends `list`, a closed list of ours (the present's copy), as a

@@ -2522,6 +2522,11 @@ impl Drop for KernelWrite {
 /// copies of buffers and textures read through tables take them again);
 /// 2, the placed textures picked by index that lie under it are due again;
 /// 4, both also for reads to plain addresses when they have finished.
+/// 8, for reads to plain addresses the textures alone (bit 2's look; from
+/// fxceless e4245f3, where bits 1, 2 and 8 are the default: textures uploaded
+/// before their data landed kept zeros, the black faces of the opening
+/// cutscene). Here `textures` = bits 1, 2 and 8, `mask:<n>` any bits; the
+/// default stays bit 1 until a run shows the fix helps.
 /// Unset or `guards`: bit 1 alone. `0`: nothing, counted only (the default
 /// until run 199). `1`: bits 1 and 2. `slots`: bit 2 alone. `all`:
 /// everything.
@@ -2537,6 +2542,8 @@ pub(crate) fn page_writes() -> u8 {
         Ok("1") => 3,
         Ok("slots") => 2,
         Ok("all") => 7,
+        Ok("textures") => 1 | 2 | 8,
+        Ok(m) if m.starts_with("mask:") => m[5..].trim().parse::<u8>().map_or(1, |n| n & 15),
         _ => 1,
     })
 }
@@ -2574,7 +2581,12 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
         WRITTEN[1].fetch_add(len as u64, Relaxed);
     } else {
         WRITTEN[3].fetch_add(1, Relaxed);
+        if mode & (4 | 8) == 0 {
+            return;
+        }
         if mode & 4 == 0 {
+            // (Bit 8 alone: the placed textures under it, not the guards.)
+            crate::descriptor::host::page_written(at, len);
             return;
         }
     }
@@ -2860,6 +2872,10 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// write access is given back.
 pub fn title_memory_remapped(at: usize, len: usize) {
     crate::texback::remapped(at, len);
+    // Host copies of placed textures filled from there are due to go
+    // (records the range only; nothing unless VICTORY_TEXTURE_FREE_UNMAPPED=1).
+    #[cfg(windows)]
+    crate::resource::note_unmapped(at as u64, len as u64);
     open(&mut title_memory_changed(at, len), at, at.saturating_add(len));
 }
 

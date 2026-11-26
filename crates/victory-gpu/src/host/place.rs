@@ -194,6 +194,17 @@ fn shaders_own(src: usize, len: usize) -> Option<std::sync::Arc<Shadow>> {
     crate::shadow::peek(src as u64, len as u64).filter(|s| s.written() && (!s.in_place() || crate::uma::enabled()))
 }
 
+/// `VICTORY_PLACE_COMMON=1` (off by default): host copies are returned to the
+/// COMMON state after a placed copy. They are created in COMMON and promoted
+/// implicitly by `CopyBufferRegion`; a promoted state sticks for the rest of
+/// the list, a promoted read state cannot be promoted to a write state, and
+/// a later read or shader use finds COPY_DEST. From VIctory-RTX 50347f8
+/// (Rubenpannen/VIctory-RTX5070 40f904b); not its other parts.
+fn common_after() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PLACE_COMMON").is_some_and(|v| v == "1"))
+}
+
 impl HostList {
     /// Copies `len` bytes of title memory at `src` to `dst`, at this place of
     /// the list (see the file). `false` if it is to be done at submission.
@@ -233,12 +244,25 @@ impl HostList {
                     };
                     unsafe {
                         self.list.CopyBufferRegion(&between, 0, &from.buffer, offset, len as u64);
-                        self.list.ResourceBarrier(&[transition(&between, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                        if common_after() {
+                            // A promoted read state cannot be promoted to a write state.
+                            self.list.ResourceBarrier(&[
+                                transition(&between, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                                transition(&from.buffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST),
+                            ]);
+                        } else {
+                            self.list.ResourceBarrier(&[transition(&between, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                        }
                         wait_for_all(host, &self.list);
                         self.list.CopyBufferRegion(&to.buffer, at, &between, 0, len as u64);
                     }
                 } else {
-                    unsafe { self.list.CopyBufferRegion(&to.buffer, at, &from.buffer, offset, len as u64) };
+                    unsafe {
+                        self.list.CopyBufferRegion(&to.buffer, at, &from.buffer, offset, len as u64);
+                        if common_after() {
+                            self.list.ResourceBarrier(&[transition(&from.buffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON)]);
+                        }
+                    }
                 }
                 STATS[2].fetch_add(1, Ordering::Relaxed);
             }
@@ -247,7 +271,12 @@ impl HostList {
             },
             (None, None) => return false,
         }
-        unsafe { wait_for_all(host, &self.list) };
+        unsafe {
+            if common_after() {
+                self.list.ResourceBarrier(&[transition(&to.buffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON)]);
+            }
+            wait_for_all(host, &self.list);
+        }
         STATS[0].fetch_add(1, Ordering::Relaxed);
         STATS[1].fetch_add(len as u64, Ordering::Relaxed);
         to.gpu_writes(self, dst as u64, len as u64);
@@ -280,7 +309,14 @@ impl HostList {
         unsafe {
             wait_for_all(host, &self.list);
             self.list.CopyBufferRegion(&between, 0, &from.buffer, from.offset(src as u64), len as u64);
-            self.list.ResourceBarrier(&[transition(&between, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            if common_after() {
+                self.list.ResourceBarrier(&[
+                    transition(&between, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                    transition(&from.buffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
+                ]);
+            } else {
+                self.list.ResourceBarrier(&[transition(&between, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            }
             wait_for_all(host, &self.list);
         }
         Some(between)
