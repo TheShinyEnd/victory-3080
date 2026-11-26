@@ -610,6 +610,38 @@ pub(crate) fn wrote(at: usize, len: usize) {
     }
 }
 
+/// The card wrote title memory `[at, at + len)` in place (`VICTORY_UMA`,
+/// `crate::uma`): nothing faulted and the kernel's write watching saw
+/// nothing of it (the card's writes do not set its bits), so the pages count
+/// as written by an asking of their own number, as after our own writes
+/// ([`wrote`]), at every address the title shows them: copies other trackers
+/// hold of the same bytes (a texture's staging, a view's own bytes) take them
+/// again. Placed textures there are due again. Returns the pages noted.
+pub(crate) fn gpu_wrote(at: usize, len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    let others = elsewhere(at, len);
+    {
+        let mut j = journal_mut();
+        let now = next_asking();
+        if j.kept {
+            j.ahead_asked = now;
+        }
+        for page in first..last {
+            j.note(page, WHOLE, now);
+        }
+        for (_, shown) in &others {
+            for other in shown {
+                j.note(other / PAGE, WHOLE, now);
+            }
+        }
+    }
+    crate::descriptor::host::remapped(at, len);
+    last - first
+}
+
 /// The blocks of `[at, at + len)` whose pages the title shows at other
 /// addresses too, and there.
 fn elsewhere(at: usize, len: usize) -> Vec<(usize, Vec<usize>)> {
@@ -2474,6 +2506,8 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 /// was noted of its blocks (guarded, clean, absent) would be taken for true
 /// of the next memory at the address.
 pub fn title_memory_freed(at: usize, len: usize) {
+    // Heaps opened over it (`VICTORY_UMA`) go before the memory does.
+    crate::uma::freed(at, len);
     let mut g = guards();
     let first = at / BLOCK;
     let noted = [g.protected.range(first..).next(), g.absent.range(first..).next(), g.foreign.range(first..).next().copied()];

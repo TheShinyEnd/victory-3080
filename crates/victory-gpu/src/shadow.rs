@@ -3019,9 +3019,14 @@ impl Shadow {
         // shortcut: another host copy of the same bytes (a title buffer
         // inside this one with a copy of its own, a texture in it) is not
         // told: the card's writes are not seen by write watching.
-        if self.place.is_some() {
+        if self.place.is_some() && !crate::uma::enabled() {
             return;
         }
+        // With `VICTORY_UMA` the range is still declared: nothing is
+        // snapshotted or copied back (`writing`, `copy_back_done` do nothing
+        // in place), but the flights' rules know title memory the card
+        // writes (the host reads none of it before the flight has run), and
+        // the other trackers are told after the run (`crate::uma::wrote`).
         self.written.store(true, Ordering::Relaxed);
         let len = len.min(self.left(address));
         list.defer_gpu_write(self, address as usize, len as usize);
@@ -3681,6 +3686,9 @@ impl Shadow {
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
         // In place: the card reads title memory itself.
         if self.place.is_some() {
+            if crate::uma::enabled() {
+                crate::uma::note_refresh(len);
+            }
             return 0;
         }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
@@ -4976,7 +4984,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // memory. Not the big ones `cards` puts in the card's memory: those
         // are read too often to stay in the PC's.
         let big = cards() && (size >= card_limits().0 || card_all());
-        if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
+        if (!big || crate::uma::big()) && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }

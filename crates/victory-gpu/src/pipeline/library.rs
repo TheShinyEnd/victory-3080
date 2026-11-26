@@ -522,6 +522,7 @@ pub(crate) fn pipeline(
     let wide = HSTRING::from(name);
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
+        let _p = victory_core::prof_scope!("pipe.compile");
         return create();
     };
     let began = std::time::Instant::now();
@@ -529,6 +530,7 @@ pub(crate) fn pipeline(
         let _all = one_call();
         let _one = same_name(name);
         let _call = call("load", name);
+        let _p = victory_core::prof_scope!("pipe.library.load");
         load(&library.library, PCWSTR(wide.as_ptr()))
     };
     // The load read the library's file (see `trim`).
@@ -548,6 +550,7 @@ pub(crate) fn pipeline(
     // Compiled outside any lock: compiles take up to seconds.
     let pso = {
         let _call = call("make", name);
+        let _p = victory_core::prof_scope!("pipe.compile");
         create()?
     };
     MADE.fetch_add(1, Ordering::Relaxed);

@@ -1471,11 +1471,15 @@ impl State {
 
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
+        let _p = victory_core::prof_scope!("draw.prepare");
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
         }
-        let Some(p) = crate::pipeline::host_pipeline_for(self.pipeline as This, &self.target_formats) else {
+        let Some(p) = ({
+            let _p = victory_core::prof_fine!("draw.pipeline_lookup");
+            crate::pipeline::host_pipeline_for(self.pipeline as This, &self.target_formats)
+        }) else {
             return false;
         };
         if p.compute || p.mesh != mesh {
@@ -1566,6 +1570,7 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        let _p = victory_core::prof_scope!("draw.bind");
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
@@ -2077,6 +2082,7 @@ impl State {
     /// copy. A list refreshes them where it first runs such a shader;
     /// title writes recorded later in the same list are not seen.
     fn heap_buffers(&self, list: &HostList) -> Option<u64> {
+        let _p = victory_core::prof_scope!("draw.heap_buffers");
         let heap = self
             .heaps
             .iter()
@@ -2524,6 +2530,7 @@ impl State {
         host: &crate::descriptor::host::HostHeap,
         mut sync: Option<&mut BakeSync>,
     ) -> bool {
+        let _p = victory_core::prof_scope!("draw.heap_textures");
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
             return true;
@@ -2538,7 +2545,11 @@ impl State {
         let per_frame = match asked {
             Some(mb) => mb << 20,
             None => {
-                let base = staging_budget_per_frame(memory.map(|[budget, ..]| budget));
+                let base = if crate::residency::legacy() {
+                    staging_budget_per_frame(memory.map(|[budget, ..]| budget))
+                } else {
+                    crate::residency::upload_budget(memory.map(|[budget, ..]| budget), false).0
+                };
                 if crate::residency::limited_host_ram() {
                     base.min(128 << 20)
                 } else {
@@ -2560,6 +2571,12 @@ impl State {
         // returned here, and a slot whose texture had been streamed out
         // kept its host copy for as long as the card was full).
         let mut room = crate::resource::room(memory);
+        // The residency probe line (`VICTORY_RESIDENCY_TRACE`, `_FIRST`).
+        crate::residency::report(memory);
+        // Bytes this pass uploaded: what the card's use, as asked at its
+        // start, does not show yet (for the small textures let in past the
+        // line).
+        let mut uploaded_here = 0u64;
         // Bytes uploaded by this pass since the card was last asked
         // whether it has room: asked again every 32 MiB (a pass may upload
         // 192 MB and more, and one asking a pass let the queue run some
@@ -2651,14 +2668,17 @@ impl State {
         // The rest waits for the next frames, as it does past the bytes.
         static SPAN_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         let span = std::time::Duration::from_millis(*SPAN_MS.get_or_init(|| {
-            std::env::var("VICTORY_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(250)
+            std::env::var("VICTORY_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or_else(|| {
+                if crate::residency::legacy() { 250 } else { crate::residency::upload_budget(None, false).1 }
+            })
         }));
         // A backlog (a scene's first minutes: 22,000 slots due, 2-3 minutes of black
         // surfaces at 192 MB a frame) gets three times the bytes and the time until it
         // drains; `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget.
         static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let catchup = *CATCHUP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
-        let (per_frame, span) = if catchup && on_time >= 1024 { (per_frame * 3, span * 3) } else { (per_frame, span) };
+        let more = if crate::residency::legacy() { 3 } else { 2 };
+        let (per_frame, span) = if catchup && on_time >= 1024 { (per_frame * more, span * more as u32) } else { (per_frame, span) };
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
         // (Not `most`: that is the longest wait between looks, used below.)
@@ -2755,10 +2775,13 @@ impl State {
             }
             let mut partly = None;
             let mut there = None;
+            let mut shape = crate::residency::Shape { slot: index, bytes: 0, width: 0, height: 0, mips: 0, format: 0, first: 0 };
             if let Some(View::Placed(false, resource, desc)) = heap.handle(index).and_then(crate::descriptor::view) {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
                 let first = crate::resource::first_mip(&desc);
                 let len = crate::resource::placed_bytes_from(&resource, first).unwrap_or(1);
+                let (width, height, mips, format) = crate::resource::describe_placed(&resource);
+                shape = crate::residency::Shape { slot: index, bytes: len, width, height, mips, format, first };
                 let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
                 if mapped == 0 {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
@@ -2808,13 +2831,28 @@ impl State {
             if !room {
                 let has_its_texture = reupload_when_full()
                     && heap.handle(index).is_some_and(|handle| host.texture_slot_made_from(index, handle));
-                if !has_its_texture {
+                // The residency policy lets small textures (and, for a
+                // decoration bake, anything that fits under the hard line)
+                // past the line instead of leaving their slots null.
+                let admitted = !has_its_texture && !crate::residency::legacy() && {
+                    if required {
+                        crate::resource::admit_bake(memory, shape.bytes, uploaded_here)
+                    } else {
+                        crate::resource::admit_copy(memory, shape.bytes, uploaded_here) != crate::residency::Admit::No
+                    }
+                };
+                if !has_its_texture && !admitted {
                     refused += 1;
+                    if !crate::residency::legacy() && shape.bytes > 0 {
+                        crate::residency::note_refused(shape, crate::residency::Why::Budget);
+                    }
                     if full_card_pass() {
                         // Held back for the frames of about four seconds
                         // (`most`), or until the card has room; the pass
                         // goes on, within a count that bounds one pass.
-                        host.texture_slot_held(index, write, frame + most);
+                        // (The policy: a second at most.)
+                        let hold = if crate::residency::legacy() { most } else { (most / 16).clamp(4, 64) };
+                        host.texture_slot_held(index, write, frame + hold);
                         if refused > 1024 {
                             break;
                         }
@@ -2823,8 +2861,8 @@ impl State {
                     }
                     continue;
                 }
-                let n = HEAP_TEXTURES_REUPLOADED_FULL.fetch_add(1, Ordering::Relaxed) + 1;
-                if n == 1 || n.is_multiple_of(500) {
+                let n = if admitted { 0 } else { HEAP_TEXTURES_REUPLOADED_FULL.fetch_add(1, Ordering::Relaxed) + 1 };
+                if n == 1 || (n != 0 && n.is_multiple_of(500)) {
                     tracing::info!(
                         so_far = n,
                         slot = index,
@@ -2836,6 +2874,9 @@ impl State {
             // `mapped == 0` reclamation (`texture_slot_gone`) has run, and
             // before mirroring a slot to an unuploaded texture.
             if !crate::residency::admit_texture_pass(required) {
+                if !crate::residency::legacy() && shape.bytes > 0 {
+                    crate::residency::note_refused(shape, crate::residency::Why::Commit);
+                }
                 served = false;
                 break;
             }
@@ -3050,6 +3091,8 @@ impl State {
             };
             crate::texture::unstage(resource);
             SPENT.fetch_add(bytes, Ordering::Relaxed);
+            uploaded_here += bytes;
+            crate::residency::note_resident(index);
             since_asked += bytes;
             if room && since_asked >= 32 << 20 {
                 since_asked = 0;
@@ -3121,6 +3164,7 @@ impl State {
         // The ray-tracing structure builder's stages run all or none.
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::probe::dropped(self.pipeline, "dispatch, ray-tracing builder off");
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
@@ -3134,6 +3178,7 @@ impl State {
                 "a dispatch without a host pipeline dropped"
             );
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::probe::dropped(self.pipeline, "dispatch");
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_drop(self.pipeline as This);
@@ -3147,6 +3192,7 @@ impl State {
         }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::probe::dropped(self.pipeline, "dispatch, bind failed");
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
             if crate::pipeline::is_builder(self.pipeline as This) {
@@ -3536,6 +3582,7 @@ impl State {
             };
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::probe::dropped(self.pipeline, "mesh dispatch");
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -3664,6 +3711,7 @@ impl State {
         half: &[(u8, u32)],
         compute: bool,
     ) -> Few<(u8, u32), 16> {
+        let _p = victory_core::prof_scope!("draw.tables");
         let mut fresh = [0u64; 4];
         let selected_slot = |mask: &[u64; 4], slot: u8| mask[usize::from(slot / 64)] & (1u64 << (slot % 64)) != 0;
         // The view shown in place of the title's at dword `at` of the table
@@ -4061,6 +4109,7 @@ impl State {
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::probe::dropped(self.pipeline, "draw");
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -4166,6 +4215,7 @@ impl State {
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::probe::dropped(self.pipeline, "indexed draw");
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -4264,13 +4314,15 @@ impl State {
         const INDEXED: u32 = 1;
         const DISPATCH: u32 = 2;
         const MESH: u32 = 10;
-        #[cfg(feature = "diagnostics")]
-        let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
-        #[cfg(not(feature = "diagnostics"))]
-        let why = |_: &str| {};
+        let why = |what: &str| {
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
+            crate::probe::indirect_dropped(what.as_ptr() as usize + ((kind as usize) << 48), || format!("indirect kind {kind}: {what}"));
+        };
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
+            crate::probe::dropped(self.pipeline, "indirect");
             return false;
         };
         // Indirect rectangles (the title's tiled lighting, 256

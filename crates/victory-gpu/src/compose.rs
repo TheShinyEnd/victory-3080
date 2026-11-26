@@ -125,6 +125,7 @@ impl Composer {
         back: &ID3D12Resource,
         (width, height): (u32, u32),
     ) -> windows::core::Result<()> {
+    let _p = victory_core::prof_scope!("compose.record");
         while self.views.len() <= slot {
             let heap = unsafe {
                 host.device

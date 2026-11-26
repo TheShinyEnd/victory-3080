@@ -24,6 +24,7 @@ pub(crate) static WAITED: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 impl Coming {
     /// What was found.
     pub(crate) fn wait(&self) -> Vec<Refresh> {
+        let _p = victory_core::prof_scope!("host.aside_wait");
         let began = std::time::Instant::now();
         let _waiting = crate::timeline::span("a list's close waits for the heap's views");
         let mut found = self.0.lock().unwrap_or_else(|e| e.into_inner());

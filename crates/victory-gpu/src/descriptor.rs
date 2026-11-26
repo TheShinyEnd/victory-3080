@@ -136,6 +136,7 @@ static SHADER_HEAPS: std::sync::RwLock<Vec<(u64, u64, usize)>> = std::sync::RwLo
 /// so `Heap::drop` cannot free the heap concurrently.
 #[cfg(windows)]
 fn mirror(handle: u64) {
+    let _p = victory_core::prof_scope!("descriptor.mirror");
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     let Some(&(_, _, at)) = heaps
         .iter()
@@ -208,6 +209,7 @@ pub(crate) struct SyncedHeaps(Option<u64>);
 
 #[cfg(windows)]
 pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
+    let _p = victory_core::prof_scope!("descriptor.begin_sync_heaps");
     if !sync_aside() {
         sync_heaps();
         return SyncedHeaps(None);
@@ -295,6 +297,7 @@ impl Drop for SyncedHeaps {
 /// `VICTORY_HEAP_SYNC=0`: not done, as before. [`SYNCED`] counts.
 #[cfg(windows)]
 pub(crate) fn sync_heaps() {
+    let _p = victory_core::prof_scope!("descriptor.sync_heaps");
     use std::sync::atomic::Ordering::Relaxed;
     if !sync_on() {
         return;
@@ -1176,6 +1179,7 @@ fn wait_for(resource: usize, handle: u64) {
 /// the thread that submits: a slot is read when a list runs.
 #[cfg(windows)]
 pub(crate) fn make_waiting() {
+    let _p = victory_core::prof_scope!("descriptor.make_waiting");
     let made = std::mem::take(&mut *MADE_LATE.lock().unwrap_or_else(|e| e.into_inner()));
     for resource in made {
         let handles = WAITING

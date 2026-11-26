@@ -725,6 +725,7 @@ pub(super) fn drain() {
         return;
     }
     let began = Instant::now();
+    let _p = victory_core::prof_scope!("wait.line_drain");
     LANE.drain();
     STATS[DRAINING].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
     STATS[DRAINS].fetch_add(1, Relaxed);
@@ -760,6 +761,7 @@ fn room(queued: u64) {
     if queued > runs_most() as u64 {
         let began = Instant::now();
         let _waiting = crate::timeline::span("a submission waits for room in the line");
+        let _p = victory_core::prof_scope!("wait.room_in_line");
         LANE.wait_runs(runs_most());
         STATS[ROOM].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
     }
@@ -830,6 +832,7 @@ pub(super) fn present(
     LANE.push(this as usize, [Job::Present(texture, overlay, shown)]);
     let began = Instant::now();
     let _waiting = crate::timeline::span("a present waits for the one before it to be sent");
+    let _p = victory_core::prof_scope!("wait.present_behind");
     LANE.wait_presents(frames_most());
     STATS[AT_PRESENT].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
 }

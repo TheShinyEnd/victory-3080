@@ -134,6 +134,15 @@ pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<
 /// buffers or a title buffer, if [`level`] asks for it and the memory can
 /// be opened; `None` leaves the caller to make a copy, as before.
 pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
+    // `VICTORY_UMA=1` takes this over (`crate::uma`: shared heaps, mapped
+    // memory, no `VirtualQuery`), whatever `VICTORY_INPLACE` says.
+    if crate::uma::enabled() {
+        let placed = crate::uma::place(start, len, window)?;
+        let at = if window { 0 } else { 2 };
+        STATS[at].fetch_add(1, Ordering::Relaxed);
+        STATS[at + 1].fetch_add(len, Ordering::Relaxed);
+        return Some(placed);
+    }
     if level() < if window { 1 } else { 2 } {
         return None;
     }
@@ -312,6 +321,9 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
 /// The runtime lets go of a section, and of its handle: no view the title
 /// sees is of it any more, and [`beside`]'s view goes.
 pub fn title_memory_section_gone(section: usize) {
+    // (Heaps over our view of it go first: the view cannot be unmapped while
+    // one stands.)
+    crate::uma::section_gone(section);
     let whole = {
         let mut v = views_mut();
         let at = v.whole.iter().position(|w| w.0 == section);
@@ -563,6 +575,73 @@ pub(crate) fn beside(at: usize, len: usize) -> Option<usize> {
         }
     };
     (base != 0).then(|| base + offset as usize)
+}
+
+/// For `crate::uma`: a run of the title's views that show consecutive bytes
+/// of one section: title addresses `[first, last)`, the section, and the
+/// offset of `first` in it.
+pub(crate) struct Run {
+    pub(crate) first: usize,
+    pub(crate) last: usize,
+    pub(crate) offset: u64,
+}
+
+/// The run of views that holds `[at, at + len)` whole, and goes on for up to
+/// `reach` bytes beyond each end where the views go on showing consecutive
+/// bytes of the section. `None` if the range is not all one run. The
+/// runtime's own record: no question to the host.
+pub(crate) fn run_around(at: usize, len: usize, reach: usize) -> Option<Run> {
+    let v = views();
+    let end = at.checked_add(len.max(1))?;
+    let (&base, &(bytes, section, offset)) = v.views.range(..=at).next_back().filter(|(base, view)| **base + view.0 > at)?;
+    let mut steps = 0usize;
+    let mut hi = base + bytes;
+    while hi < end.saturating_add(reach) && steps < 1 << 16 {
+        match v.views.get(&hi) {
+            Some(&(n, s, o)) if s == section && o == offset + (hi - base) as u64 => hi += n,
+            _ => break,
+        }
+        steps += 1;
+    }
+    if hi < end {
+        return None;
+    }
+    let (mut lo, mut first) = (base, offset);
+    while lo > at.saturating_sub(reach) && steps < 1 << 17 {
+        match v.views.range(..lo).next_back() {
+            Some((&b, &(n, s, o))) if b + n == lo && s == section && o + n as u64 == first => {
+                lo = b;
+                first = o;
+            }
+            _ => break,
+        }
+        steps += 1;
+    }
+    Some(Run { first: lo, last: hi, offset: first })
+}
+
+/// For `crate::uma`: the address of our own view of the whole of `section`
+/// (made when first asked for, as [`beside`] makes it, and kept).
+pub(crate) fn window_base(section: usize) -> Option<usize> {
+    {
+        let v = views();
+        if let Some(w) = v.whole.iter().find(|w| w.0 == section) {
+            return (w.1 != 0).then_some(w.1);
+        }
+    }
+    let mut v = views_mut();
+    if let Some(w) = v.whole.iter().find(|w| w.0 == section) {
+        return (w.1 != 0).then_some(w.1);
+    }
+    let &(_, bytes, _) = v.sections.iter().find(|s| s.0 == section)?;
+    // SAFETY: the whole of a section the runtime made; a view the title
+    // sees is of it, so its handle is open.
+    let base = unsafe { mem::MapViewOfFile(section as _, mem::FILE_MAP_WRITE, 0, 0, bytes as usize) }.Value as usize;
+    if base == 0 {
+        tracing::warn!(error = %std::io::Error::last_os_error(), "no view of the title's pages beside its own");
+    }
+    v.whole.push((section, base));
+    (base != 0).then_some(base)
 }
 
 /// Our own address of the 64 KiB page the title sees at `page` ([`beside`]),

@@ -179,6 +179,9 @@ pub extern "system" fn XMemVirtualAlloc(
     }
     if !at.is_null() && !placeholder {
         victory_gpu::title_memory_allocated(at as usize, size);
+        // For zero-copy title memory (`VICTORY_UMA`): what the title has
+        // committed read-write, from our own record (no `VirtualQuery`).
+        victory_gpu::title_allocation(at as usize, size, constrained, kind & MEM_COMMIT != 0 && protect == PAGE_READWRITE);
     }
     note_protection(asked, kind, flags, at as usize, size);
     at

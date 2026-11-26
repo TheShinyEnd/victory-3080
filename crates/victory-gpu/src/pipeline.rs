@@ -148,7 +148,13 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
-                let done = translate(&self.container);
+                let began = std::time::Instant::now();
+                let done = {
+                    let _p = victory_core::prof_scope!("shader.translate");
+                    translate(&self.container)
+                };
+                victory_core::prof_top!("shader.translate", began.elapsed().as_nanos(), || format!("{} {}", self.stage, self.hash));
+
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
                 if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
@@ -478,6 +484,15 @@ pub(crate) fn host_pipeline_for<'a>(this: This, bound: &host::TargetFormats) -> 
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {
     make::waiting()
+}
+
+/// Why draws and dispatches of `this` found no host pipeline (the drop
+/// report, every build): its shaders' hashes and what became of the pipeline.
+pub(crate) fn drop_reason(this: This) -> String {
+    if this.is_null() {
+        return "no pipeline set".to_owned();
+    }
+    make::why_dropped(&pipeline(this).host)
 }
 
 /// Draws and dispatches dropped since the last [`take_drops`], by reason

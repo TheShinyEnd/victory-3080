@@ -1296,6 +1296,41 @@ fn base_level(desc: &ResourceDesc, first: u32) -> u32 {
     base
 }
 
+/// [`base_level`], and past it the levels the residency policy drops from a
+/// host copy bigger than `VICTORY_TEXTURE_CAP_MB` (a card of 10 GB cannot
+/// hold every 4K texture of a scene: the copy starts at the first level that
+/// fits, always the same one for a texture, so no copy is made again for it).
+/// Views start at `first`; those below the copy's level are shown from it
+/// (`from_base`). `VICTORY_RESIDENCY=legacy`: no drop.
+#[cfg(windows)]
+fn capped_level(desc: &ResourceDesc, first: u32) -> u32 {
+    let base = base_level(desc, first);
+    let cap = crate::residency::mip_cap_bytes();
+    if cap == u64::MAX || desc.mip_levels <= 1 {
+        return base;
+    }
+    const TEXTURE_2D: u32 = 3;
+    if !fills(desc) || desc.dimension != TEXTURE_2D || desc.depth_or_array_size != 1 || desc.sample_count > 1 {
+        return base;
+    }
+    // Asked for every slot written: remembered (a texture's answer is fixed).
+    type Key = (u64, u32, u16, u32, u64, u32, u32);
+    thread_local! {
+        static KNOWN: std::cell::RefCell<std::collections::HashMap<Key, u32>> = std::cell::RefCell::default();
+    }
+    let key = (desc.width, desc.height, desc.mip_levels, desc.format, desc.alignment, desc.flags, base);
+    if let Some(known) = KNOWN.with(|k| k.borrow().get(&key).copied()) {
+        return known;
+    }
+    let levels = u32::from(desc.mip_levels);
+    let size = |level: u32| footprint(&desc.from_level(level)).map_or(0, |f| f.size);
+    let wanted = crate::residency::cap_base(size, base, levels, cap);
+    // A level the layout allows a copy to begin at: at or below `wanted`.
+    let capped = if wanted == base { base } else { base.max(base_level(desc, wanted)) };
+    KNOWN.with(|k| k.borrow_mut().insert(key, capped));
+    capped
+}
+
 /// The bytes of title memory a placed texture with the resource description
 /// `desc` is read from for a view that starts at level `first`; `None` as
 /// [`placed_bytes`]. Remembered: asked for every slot that is looked at.
@@ -1353,7 +1388,7 @@ pub(crate) fn want_level(this: This, first: u32) {
         r.host.wanted.fetch_min(first, Relaxed);
         return;
     };
-    if host.base == 0 || host.base <= base_level(&r.desc, first) {
+    if host.base == 0 || host.base <= capped_level(&r.desc, first) {
         return;
     }
     r.host.wanted.store(first, Relaxed);
@@ -1582,7 +1617,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             let viewed = crate::descriptor::host::first_viewed(r.data() as u64).unwrap_or(u32::MAX);
             let first = wanted.min(viewed);
             if first != u32::MAX {
-                base = base_level(&r.desc, first);
+                base = capped_level(&r.desc, first);
             }
         }
         let texture = match texture {
@@ -1676,6 +1711,9 @@ fn texture_floor_bytes(vram_budget: Option<u64>) -> u64 {
 pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
     const WITHOUT_BUDGET: u64 = 4 << 30;
+    if !crate::residency::legacy() {
+        return admit_copy(memory, 0, 0) != crate::residency::Admit::No;
+    }
     static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     let limit = *LIMIT.get_or_init(|| {
         let mb = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
@@ -1702,6 +1740,73 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
         }
         None => filled < WITHOUT_BUDGET,
     }
+}
+
+/// The card's memory in use as the texture admission counts it: what the
+/// system says, less the free blocks of our texture pool, plus what is kept
+/// for card copies of buffers and for render targets not made yet.
+#[cfg(windows)]
+pub(crate) fn counted_use(used: u64) -> u64 {
+    used.saturating_sub(crate::pool::texture_room()) + crate::shadow::card_room_kept() + targets_room_kept()
+}
+
+/// The residency policy's answer ([`crate::residency::Policy`]) to a request
+/// for a new host copy of `bytes` bytes (0: "is there any room"). `used` is
+/// added to what the system reports (bytes uploaded since it was asked).
+/// With `VICTORY_RESIDENCY=legacy`: the base's rule ([`room`]), as yes or no.
+#[cfg(windows)]
+pub(crate) fn admit_copy(memory: Option<[u64; 4]>, bytes: u64, used_since: u64) -> crate::residency::Admit {
+    use crate::residency::Admit;
+    use std::sync::atomic::Ordering::Relaxed;
+    const WITHOUT_BUDGET: u64 = 4 << 30;
+    if crate::residency::legacy() {
+        return if room(memory) { Admit::Yes } else { Admit::No };
+    }
+    static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let limit = *LIMIT.get_or_init(|| {
+        let mb = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
+        mb.trim().parse::<u64>().ok().map(|mb| mb << 20)
+    });
+    let filled = KINDS[1].load(Relaxed) + crate::tiles::given_total();
+    if let Some(limit) = limit {
+        return if filled < limit { Admit::Yes } else { Admit::No };
+    }
+    match memory {
+        Some([budget, used, ..]) if budget > 0 => {
+            let used = counted_use(used).saturating_add(used_since);
+            let how = crate::residency::policy(budget).admit(used, filled, bytes);
+            // (A floor copy is only admitted when the system's use is under the hard line.)
+            if matches!(how, Admit::Floor | Admit::Small) && bytes > 0 {
+                crate::residency::note_admitted(how);
+            }
+            how
+        }
+        _ if filled < WITHOUT_BUDGET => Admit::Yes,
+        _ => Admit::No,
+    }
+}
+
+/// Whether a texture a decoration bake samples may be given a host copy of
+/// `bytes` bytes: a bake cannot retry, so anything that stays under the hard
+/// line (no spill into the PC's memory) is let in.
+#[cfg(windows)]
+pub(crate) fn admit_bake(memory: Option<[u64; 4]>, bytes: u64, used_since: u64) -> bool {
+    match memory {
+        Some([budget, used, ..]) if budget > 0 => {
+            counted_use(used).saturating_add(used_since).saturating_add(bytes) <= crate::residency::policy(budget).hard_line
+        }
+        _ => true,
+    }
+}
+
+/// The shape of a placed texture's resource description (the words a view
+/// of placed memory carries), for the probe lines: width, height, levels,
+/// format.
+#[cfg(windows)]
+pub(crate) fn describe_placed(desc: &[u32; 14]) -> (u64, u32, u32, u32) {
+    // SAFETY: 56 bytes in the description's layout (as `placed_bytes_from`).
+    let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+    (d.width, d.height, u32::from(d.mip_levels), d.format)
 }
 
 /// The bytes of the card's memory the texture queue leaves free for
@@ -2035,7 +2140,15 @@ pub(crate) fn let_go_idle() {
     static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let keep = *KEEP
         .get_or_init(|| !matches!(std::env::var("VICTORY_TEXTURE_KEEP").as_deref(), Ok("0") | Ok("1")));
+    // Frames a copy must be unused too (the policy's: more than the base's
+    // four, so that what a few slow frames did not sample stays).
+    let mut frames = IDLE_FRAMES;
     let (idle_ms, most) = match memory {
+        Some([budget, used, ..]) if budget > 0 && !crate::residency::legacy() => {
+            let (ms, idle_frames, most) = crate::residency::eviction(budget, counted_use(used));
+            frames = idle_frames;
+            (ms, most)
+        }
         Some([budget, used, ..]) if keep => {
             let used = used.saturating_sub(crate::pool::texture_room())
                 + crate::shadow::card_room_kept()
@@ -2055,7 +2168,7 @@ pub(crate) fn let_go_idle() {
             // SAFETY: as below.
             let r = unsafe { &*(at as *const Resource) };
             let used = r.host.used.load(Relaxed);
-            if used != 0 && fills(&r.desc) && crate::host::long_ago(used, idle_ms, IDLE_FRAMES) {
+            if used != 0 && fills(&r.desc) && crate::host::long_ago(used, idle_ms, frames) {
                 by_age.push((used & 0xffff_ffff, at));
             }
         }
@@ -2091,13 +2204,13 @@ pub(crate) fn let_go_idle() {
         let r = unsafe { &*(at as *const Resource) };
         // (Without its lock first: most were used lately or have none.)
         let used = r.host.used.load(Relaxed);
-        if used == 0 || !fills(&r.desc) || !crate::host::long_ago(used, idle_ms, IDLE_FRAMES) || crate::texture::host_wrote(at) {
+        if used == 0 || !fills(&r.desc) || !crate::host::long_ago(used, idle_ms, frames) || crate::texture::host_wrote(at) {
             continue;
         }
         let gone = {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
             let idle = made.as_ref().is_some_and(|(host, _)| {
-                crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
+                crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, frames)
                     && std::sync::Arc::strong_count(host) == 1
                     && crate::host::references(&host.texture) == 1
             });

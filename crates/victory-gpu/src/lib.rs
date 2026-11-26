@@ -56,6 +56,8 @@ mod pool;
 mod popwatch;
 #[cfg(windows)]
 mod primitive;
+#[cfg(windows)]
+mod probe;
 pub mod query;
 pub mod queue;
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -74,6 +76,8 @@ pub mod shader_cache;
 mod memory;
 #[cfg(windows)]
 mod shadow;
+#[cfg(windows)]
+mod uma;
 #[cfg(windows)]
 mod tiles;
 pub mod signature;
@@ -109,6 +113,8 @@ pub fn switched(switch: &str) -> Option<bool> {
 pub fn frame_phase() -> u32 {
     copystat::phase()
 }
+#[cfg(windows)]
+pub use uma::title_allocation;
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
 #[cfg(windows)]

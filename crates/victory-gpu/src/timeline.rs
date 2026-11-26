@@ -30,19 +30,28 @@ mod report;
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use hooks::import;
 #[cfg(all(windows, feature = "diagnostics"))]
-pub use record::{Span, span};
-#[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) use record::{called, card_wait, on, polled, presented, sent, ticks, title_thread, told};
 
-/// A span of ours: from where it is made until it is dropped.
-#[cfg(not(all(windows, feature = "diagnostics")))]
-pub struct Span;
+/// A span of ours: from where it is made until it is dropped. Every build
+/// also counts it as a scope of the frame profiler (`victory_core::prof`,
+/// named by the span's text); a diagnostics build also records it in the
+/// timeline.
+pub struct Span {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    timeline: record::Span,
+    /// Dropped before the next one begins (`next`).
+    profiled: Option<victory_core::prof::Span>,
+}
 
-#[cfg(not(all(windows, feature = "diagnostics")))]
 impl Span {
     /// The span ends here and another begins.
     #[inline(always)]
-    pub fn next(&mut self, _name: &'static str) {}
+    pub fn next(&mut self, name: &'static str) {
+        self.profiled = None;
+        #[cfg(all(windows, feature = "diagnostics"))]
+        self.timeline.next(name);
+        self.profiled = Some(victory_core::prof::Span::named(name));
+    }
 
     /// The span ends here.
     #[inline(always)]
@@ -50,8 +59,11 @@ impl Span {
 }
 
 /// A span named `name`.
-#[cfg(not(all(windows, feature = "diagnostics")))]
 #[inline(always)]
-pub fn span(_name: &'static str) -> Span {
-    Span
+pub fn span(name: &'static str) -> Span {
+    Span {
+        #[cfg(all(windows, feature = "diagnostics"))]
+        timeline: record::span(name),
+        profiled: Some(victory_core::prof::Span::named(name)),
+    }
 }

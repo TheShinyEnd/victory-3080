@@ -150,12 +150,13 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 /// is a host GPU.
 #[cfg(windows)]
 fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
+    let _p = victory_core::prof_fine!("list.state_call");
     let Some(list) = host_list(this) else { return };
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // SAFETY: the title passes one of our lists.
     let state = unsafe { &(*this.cast::<List>()).state };
-    f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
+    f(list, &mut *victory_core::prof::waits!(state, "lock.list_state.wait"));
     #[cfg(feature = "diagnostics")]
     crate::copystat::recorded(started);
 }
@@ -654,6 +655,7 @@ extern "system" fn list_type(this: This) -> u32 {
     unsafe { (*this.cast::<List>()).kind }
 }
 extern "system" fn close(this: This) -> HRESULT {
+    let _p = victory_core::prof_scope!("list.close");
     let _called = crate::timeline::span("the title's Close");
     #[cfg(windows)]
     if let Some(host) = host_list(this) {
@@ -662,6 +664,7 @@ extern "system" fn close(this: This) -> HRESULT {
     S_OK
 }
 extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT {
+    let _p = victory_core::prof_scope!("list.reset");
     if allocator.is_null() {
         return E_INVALIDARG;
     }
@@ -777,6 +780,7 @@ const UAV_BARRIER: Barrier = Barrier {
 
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
+    let _p = victory_core::prof_scope!("list.barrier");
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && !barriers.is_null()
@@ -870,6 +874,7 @@ extern "system" fn copy_buffer_region(
     src_offset: u64,
     len: u64,
 ) {
+    let _p = victory_core::prof_scope!("list.copy_buffer_region");
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && let Some(to) = buffer_range(dst, dst_offset, len)
@@ -902,6 +907,7 @@ fn unlike(dst: This, src: This) -> bool {
 pub(crate) static SELF_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
+    let _p = victory_core::prof_scope!("list.copy_resource");
     #[cfg(windows)]
     {
         let Some(list) = host_list(this) else {
@@ -992,6 +998,7 @@ extern "system" fn copy_texture_region(
     src: *const CopyLocation,
     source_box: *const [u32; 6],
 ) {
+    let _p = victory_core::prof_scope!("list.copy_texture_region");
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::{D3D12_BOX, D3D12_TEXTURE_COPY_LOCATION};
@@ -1473,6 +1480,7 @@ extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
 /// `THREAD_DIMENSIONS`; the ray-tracing structure builder dispatches this way).
 extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
     count_dispatch();
+    let _p = victory_core::prof_scope!("list.dispatch");
     #[cfg(windows)]
     with_state(this, |list, s| s.dispatch(list, x, y, z, flags));
     #[cfg(not(windows))]
@@ -1542,6 +1550,7 @@ static ALLOCATOR_FUNCTIONS: Table<24> = {
 };
 
 extern "system" fn set_pipeline(this: This, pipeline: This) {
+    let _p = victory_core::prof_scope!("list.set_pipeline");
     crate::pipeline::bound(pipeline);
     #[cfg(windows)]
     with_state(this, |_, state| state.set_pipeline(pipeline));
@@ -1557,6 +1566,7 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
 /// (Arguments may be what earlier shaders wrote from here on:
 /// `State::synced`.)
 extern "system" fn sync(this: This, flags: u32, control: u32, address: u64, size: u64) {
+    let _p = victory_core::prof_scope!("list.sync");
     #[cfg(windows)]
     {
         with_state(this, |_, state| state.synced());
@@ -1782,12 +1792,14 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
+        let _p = victory_core::prof_scope!("list.draw");
         with_state(this, |list, s| {
             s.draw(list, vertices, instances, first, first_instance)
         });
     }
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
+        let _p = victory_core::prof_scope!("list.dispatch");
         with_state(this, |list, s| s.dispatch(list, x, y, z, 0));
     }
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
@@ -1798,6 +1810,7 @@ mod state {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(x, y, z, "a mesh dispatch with y or z groups"));
         }
+        let _p = victory_core::prof_scope!("list.dispatch_mesh");
         with_state(this, |list, s| s.dispatch_mesh(list, x));
     }
     /// `DispatchMeshX(x, flags, indirect arguments, payload)`.
@@ -1827,6 +1840,7 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
+        let _p = victory_core::prof_scope!("list.draw_indexed");
         with_state(this, |list, s| {
             s.draw_indexed(list, indices, instances, first, base, first_instance)
         });
@@ -1892,6 +1906,7 @@ extern "system" fn execute_indirect(
     count_offset: u64,
 ) {
     count_draw();
+    let _p = victory_core::prof_scope!("list.execute_indirect");
     let Some((stride, args)) = crate::signature::layout(signature) else {
         return;
     };
@@ -1920,6 +1935,11 @@ extern "system" fn execute_indirect(
         return;
     }
     INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    victory_core::prof_tally!("drop.indirect", signature as usize, || format!(
+        "signature stride {stride} args {args:?} max {max} arguments in a buffer {} counted {}",
+        address.is_some(),
+        !count.is_null()
+    ));
     static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     if !seen.contains(&(signature as usize)) {
@@ -2089,6 +2109,7 @@ pub(crate) fn waits_by_list(lists: &[This]) -> Vec<Vec<ValueWait>> {
 }
 
 fn wait_for(this: This, address: u64, comparison: u32, reference: u64, wide: bool) {
+    let _p = victory_core::prof_scope!("list.wait_value");
     let wait = ValueWait {
         address,
         comparison,

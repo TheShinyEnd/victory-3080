@@ -189,20 +189,23 @@ unsafe fn wait_for_all(host: &Host, list: &ID3D12GraphicsCommandList) {
 /// The host copy of `[src, src + len)` if shaders write it: what it holds at
 /// a place in a list is not what title memory holds at submission.
 fn shaders_own(src: usize, len: usize) -> Option<std::sync::Arc<Shadow>> {
-    crate::shadow::peek(src as u64, len as u64).filter(|s| s.written() && !s.in_place())
+    // (Title memory in place, `VICTORY_UMA`, is a copy for this: its shaders'
+    // writes are in the card's reads of it, at the place in the list.)
+    crate::shadow::peek(src as u64, len as u64).filter(|s| s.written() && (!s.in_place() || crate::uma::enabled()))
 }
 
 impl HostList {
     /// Copies `len` bytes of title memory at `src` to `dst`, at this place of
     /// the list (see the file). `false` if it is to be done at submission.
     pub(crate) fn place_copy(&self, dst: usize, src: usize, len: usize) -> bool {
+        let _p = victory_core::prof_scope!("host.place_copy");
         if !on() {
             return false;
         }
         let Some(host) = host() else {
             return false;
         };
-        let Some(to) = crate::shadow::peek(dst as u64, len as u64).filter(|s| !s.in_place()) else {
+        let Some(to) = crate::shadow::peek(dst as u64, len as u64).filter(|s| !s.in_place() || crate::uma::enabled()) else {
             return false;
         };
         let own = shaders_own(src, len);

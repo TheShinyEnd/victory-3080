@@ -93,6 +93,7 @@ extern "system" fn completed_called(this: This) -> u64 {
     value
 }
 extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c_void) -> HRESULT {
+    let _p = victory_core::prof_scope!("fence.set_event_on_completion");
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     if fence.value.load(Ordering::Acquire) >= value {
@@ -153,6 +154,7 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
 }
 /// Moves the fence to `value` and sets the events that waited for it.
 pub(crate) fn set(this: This, value: u64) {
+    let _p = victory_core::prof_scope!("fence.set");
     let fence = fence(this);
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::timeline::told("a fence set", this as usize, value);

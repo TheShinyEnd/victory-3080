@@ -151,9 +151,15 @@ impl Pending {
 
     fn make(&self) {
         self.made.get_or_init(|| {
+            let _p = victory_core::prof_scope!("pipe.make");
             let began = Instant::now();
             let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
             super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
+            victory_core::prof_top!("pipeline.make", began.elapsed().as_nanos(), || format!(
+                "{} {}",
+                hashes(self),
+                if made.is_some() { "made" } else { "refused" }
+            ));
             made
         });
         let (lock, done) = &DONE;
@@ -181,6 +187,36 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
             } else {
                 failed.join(" + ")
             })
+        }
+    }
+}
+
+/// Why a draw or dispatch with `p` found no host pipeline (the drop report;
+/// unlike [`missing`] it is there in every build).
+pub(crate) fn why_dropped(p: &Pending) -> String {
+    let hashes = hashes(p);
+    if let Some(left) = p.left_out {
+        return format!("left out ({left}) {hashes}");
+    }
+    match p.made.get() {
+        Some(Some(_)) => format!("has a host pipeline, not run (bind or prepare refused) {hashes}"),
+        None => format!(
+            "not made yet (queue state {}, waited {} ms) {hashes}",
+            p.queue_state.load(Ordering::Relaxed),
+            p.waited_us.load(Ordering::Relaxed) / 1000
+        ),
+        Some(None) => {
+            let failed: Vec<String> = p
+                .shaders
+                .iter()
+                .filter(|s| matches!(s.translated.get(), Some(None)))
+                .map(|s| format!("{} {}", s.stage, s.hash))
+                .collect();
+            if failed.is_empty() {
+                format!("host pipeline refused {hashes}")
+            } else {
+                format!("shader does not translate: {}", failed.join(" + "))
+            }
         }
     }
 }
@@ -288,6 +324,7 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         super::library::note_used(&p.key);
     }
     if p.made.get().is_none() {
+        let _p = victory_core::prof_scope!("pipe.request");
         start(p, REQUESTED);
         wait(p, crate::frame::current());
     }
@@ -347,6 +384,7 @@ fn wait_once() -> bool {
 
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
+    let _p = victory_core::prof_scope!("pipe.wait");
     let screen = p.screen && screens_first();
     let budget = if screen { screen_budget() } else { wait_budget() };
     if budget.is_zero() {
@@ -537,7 +575,7 @@ fn start(p: &Arc<Pending>, priority: u8) {
         }
         return;
     }
-    let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut queue = victory_core::prof::waits!(QUEUE, "lock.pipe_queue.wait");
     if let Some(new) = queue.push(p, priority) {
         if new {
             PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
@@ -607,6 +645,7 @@ fn workers() -> bool {
                     }
                     loop {
                         let p = next(screens_only);
+                        victory_core::prof_count!("pipe.queue_depth_at_take", WAITING.load(Ordering::Relaxed));
                         p.make();
                         if p.was_slow.load(Ordering::Relaxed) {
                             let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());

@@ -3273,6 +3273,7 @@ pub(crate) fn late_met_known(wait: &crate::list::ValueWait) -> Option<bool> {
 /// Settles the flights in the air, if any ([`Host::settle`]), for reason
 /// `why` (one of the `WHY_` places). Not from inside a submission.
 pub(crate) fn settle_now(why: usize) {
+    let _p = victory_core::prof_scope!("host.settle_now");
     if !late() {
         return;
     }
@@ -3397,6 +3398,7 @@ fn late_threads() {
 /// as waiting for the card. The caller may hold the submission lock: the
 /// thread that lands flights never takes it.
 fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
+    let _p = victory_core::prof_scope!("host.relay_wait");
     let mut line = line();
     if done(&line) {
         return;
@@ -3538,7 +3540,7 @@ struct RelayBack {
 fn relay_hand_back(back: &[Declared]) -> RelayBack {
     let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
     for (shadow, declared) in back {
-        if shadow.carded() {
+        if shadow.carded() || told_in_place(shadow, declared) {
             continue;
         }
         let mut spans: Vec<(usize, usize)> = Vec::new();
@@ -3702,6 +3704,7 @@ fn late_line(frames: f64) {
         }
     }
     crate::land::log(frames);
+    crate::uma::log(frames);
     if place::on() {
         let t: Vec<f64> = place::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
         tracing::info!(
@@ -3893,6 +3896,7 @@ pub(crate) fn walls_trace() -> bool {
 /// without it, so the title read a buffer nobody wrote, as before read-backs
 /// were made (the exposure metering's two small float targets, every frame).
 fn read_backs(list: &HostList) {
+    let _p = victory_core::prof_scope!("host.read_backs");
     // Textures shaders wrote that the title reads on the CPU
     // ([`crate::texback`]).
     for back in &list.deferred().texture_backs {
@@ -3928,15 +3932,32 @@ fn read_backs(list: &HostList) {
     }
 }
 
+/// A declared range of a copy that is title memory in place (`crate::uma`,
+/// `VICTORY_UMA`): the shaders wrote the title's own bytes, so nothing goes
+/// back, and the other trackers are told what was written. `true` for such
+/// a copy.
+fn told_in_place(shadow: &std::sync::Arc<crate::shadow::Shadow>, declared: &[(usize, usize)]) -> bool {
+    if !shadow.in_place() || !crate::uma::enabled() {
+        return false;
+    }
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    join_ranges(&mut spans, declared.iter().copied());
+    for (from, to) in spans {
+        crate::uma::wrote(from, to - from);
+    }
+    true
+}
+
 /// After the card ran what declared `back`: what shaders wrote there goes
 /// into title memory, and the ranges are done with.
 fn hand_back(back: &[Declared]) {
+    let _p = victory_core::prof_scope!("host.hand_back");
     if crate::shadow::wide_back() {
         // Every range first (the pieces that differ, found on several
         // threads), then the merges, in order, as below.
         let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
         for (shadow, declared) in back {
-            if shadow.carded() {
+            if shadow.carded() || told_in_place(shadow, declared) {
                 continue;
             }
             let mut sorted = declared.clone();
@@ -3970,6 +3991,9 @@ fn hand_back(back: &[Declared]) {
         if shadow.carded() {
             // Done before (`Host::card_back`).
             shadow.copy_back_done(declared);
+            continue;
+        }
+        if told_in_place(shadow, declared) {
             continue;
         }
         // Each byte compared once: the world declares dozens of views
@@ -4056,6 +4080,7 @@ impl Host {
 
     /// A new list, open for recording.
     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
+        let _p = victory_core::prof_scope!("host.new_list");
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -4293,6 +4318,7 @@ impl Host {
     /// `picked`: ranges that may be written too, and ranges to look at
     /// (`crate::picked`).
     fn card_before(&self, declared: &[Declared], picked: &crate::picked::Ranges, flown: bool) -> Option<CardPlan> {
+        let _p = victory_core::prof_scope!("host.card_before");
         use std::sync::Arc;
         if !crate::shadow::cards() {
             return None;
@@ -4645,6 +4671,7 @@ impl Host {
     /// their flight. `meanwhile` is called while the fetch is on its way, if
     /// there is one.
     fn relay_card_back(&self, plans: &[(&CardPlan, u64)], fetch: &mut Option<RelayFetch>, meanwhile: &mut dyn FnMut()) {
+        let _p = victory_core::prof_scope!("host.relay_card_back");
         use crate::land;
         let gathering = std::time::Instant::now();
         let differs = {
@@ -4895,6 +4922,7 @@ impl Host {
     /// bottom-of-pipe writes and the fence signals behind it. Title memory
     /// is complete before the title is told anything.
     fn relay_land(&self, items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
+        let _p = victory_core::prof_scope!("host.relay_land");
         let landing = std::time::Instant::now();
         let mut stage = crate::timeline::span("landing: what is to be looked through");
         {
@@ -5045,6 +5073,7 @@ impl Host {
         submitted: &mut u64,
         seen: &mut std::collections::HashSet<(usize, usize, usize)>,
     ) {
+        let _p = victory_core::prof_scope!("host.card_back");
         if plan.ranges.is_empty() {
             return;
         }
@@ -5197,6 +5226,7 @@ impl Host {
     /// [`Host::execute_late`] of parts of submissions in one: another begins
     /// at each place of `order` in `parts` ([`joins`]).
     pub(crate) fn execute_parts(&self, lists: Vec<crate::list::Detached>, order: Vec<usize>, parts: &[usize]) {
+        let _p = victory_core::prof_scope!("host.execute_parts");
         if order.is_empty() {
             crate::list::recycle(lists, &order);
             return;
@@ -5332,6 +5362,7 @@ impl Host {
     /// the merge writes the copies' CPU side, which a flight still on the
     /// card may be writing too.
     fn settle(&self, submitted: &mut u64, why: usize) {
+        let _p = victory_core::prof_scope!("host.settle");
         if !late() {
             return;
         }
@@ -6362,6 +6393,7 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
+        let _p = victory_core::prof_scope!("host.list_reset");
         self.changed_something();
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
@@ -6681,6 +6713,7 @@ impl HostList {
     /// colour twin it first copies the side the list uses as it finds it
     /// from the other, if a list submitted earlier left it behind.
     fn prelude(&self) -> Option<ID3D12CommandList> {
+        let _p = victory_core::prof_scope!("host.prelude");
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
         let host_state = |state: u32| D3D12_RESOURCE_STATES(state as i32);
@@ -7349,6 +7382,7 @@ impl HostList {
     /// `taken` names (by their place) are left out: they are done on the
     /// card ([`card_steps`]).
     fn run_deferred(&self, batch: &mut Batch, air: &[(usize, usize)], taken: impl Fn(usize) -> bool) {
+        let _p = victory_core::prof_scope!("host.run_deferred");
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         // The time and the bytes of the copies and fills, some 13,000 a
@@ -8012,6 +8046,7 @@ impl Batch {
     /// Before the steps of `runs` ([`refresh_front`]), a new part of the
     /// submission beginning at each of `parts`.
     fn refresh_front(&mut self, runs: &[&HostList], parts: &[usize]) {
+        let _p = victory_core::prof_scope!("host.refresh_front");
         let mut copies: ByCopy<std::sync::Arc<crate::shadow::Shadow>> = ByCopy::default();
         let mut due = Vec::new();
         let mut touches = Vec::new();
@@ -8105,6 +8140,7 @@ impl Batch {
     /// Before the steps of `runs` ([`ahead_of_writes`]); copies and fills
     /// that `taken` names are not done on the CPU.
     fn refresh_ahead(&mut self, runs: &[&HostList], taken: impl Fn(&HostList, usize) -> bool) {
+        let _p = victory_core::prof_scope!("host.refresh_ahead");
         let mut copies: ByCopy<std::sync::Arc<crate::shadow::Shadow>> = ByCopy::default();
         let mut touches = Vec::new();
         'steps: for list in runs {
@@ -8212,6 +8248,7 @@ impl Batch {
     }
 
     fn flush_all(&mut self) {
+        let _p = victory_core::prof_scope!("host.flush_all");
         // Most of a flush's copies are as they were: they are told so here,
         // from what the submission's asking found, before anything is asked
         // and any thread woken. (Thousands of them, the heap's buffer views
@@ -8713,6 +8750,10 @@ struct Meter {
     #[cfg(feature = "diagnostics")]
     copy_stats_frames: u64,
     drawn: u64,
+    /// The counters at the last frame, for the frame profiler's per-frame
+    /// amounts (`probe`): draws, drops, submission and copy-back times and
+    /// bytes, the preparing counters.
+    prof_last: [u64; 12],
     logged: std::time::Instant,
     /// The caption the window had, once read.
     caption: Option<Vec<u16>>,
@@ -8720,6 +8761,7 @@ struct Meter {
 
 impl Meter {
     fn new() -> Self {
+        crate::probe::init();
         let now = std::time::Instant::now();
         Meter {
             since: now,
@@ -8727,9 +8769,59 @@ impl Meter {
             #[cfg(feature = "diagnostics")]
             copy_stats_frames: 0,
             drawn: crate::draw::drawn(),
+            prof_last: Meter::prof_counters(),
             logged: now,
             caption: None,
         }
+    }
+
+    /// The counters the frame profiler takes per frame.
+    fn prof_counters() -> [u64; 12] {
+        let load = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
+        [
+            crate::draw::drawn(),
+            crate::draw::dropped_now(),
+            load(&SUBMISSION_US[0]),
+            load(&SUBMISSION_US[1]),
+            load(&COPY_BACK[0]),
+            load(&COPY_BACK[1]),
+            load(&PREPARING[0]),
+            load(&PREPARING[1]),
+            load(&PREPARING[2]),
+            load(&PREPARING[3]),
+            crate::pipeline::making(),
+            crate::draw::HEAP_TEXTURE_BYTES.load(Ordering::Relaxed),
+        ]
+    }
+
+    /// Ends the profiler's frame: hands it what the counters gained since
+    /// the last one.
+    fn profile_frame(&mut self) {
+        use victory_core::prof::Extra;
+        let now = Meter::prof_counters();
+        // A counter cleared by its own line (or `take_dropped`) restarts from zero.
+        let gain = |i: usize| if now[i] >= self.prof_last[i] { now[i] - self.prof_last[i] } else { now[i] };
+        let us = |i: usize| gain(i) * 1000;
+        let draws = gain(0);
+        let extra = |name, time, total| Extra { name, time, total, calls: 0 };
+        let extras = [
+            extra("frame.draws", false, draws),
+            extra("frame.dropped_draws", false, gain(1)),
+            extra("sub.preparing", true, us(2)),
+            extra("sub.gpu_wait", true, us(3)),
+            extra("sub.copy_back", true, us(4)),
+            extra("sub.copy_back.bytes", false, gain(5)),
+            extra("prep.copies", true, us(6)),
+            extra("prep.copies.bytes", false, gain(7)),
+            extra("prep.textures", true, us(8)),
+            extra("prep.textures.bytes", false, gain(9)),
+            // Gauges: their per-frame average is the average depth.
+            extra("pipe.queue_depth", false, now[10]),
+            extra("tex.picked_upload.bytes", false, gain(11)),
+        ];
+        self.prof_last = now;
+        victory_core::prof::frame_end(draws > 300, &extras);
+        crate::probe::frame_marked();
     }
 
     /// Whether the next frame counted makes the frame-rate line.
@@ -8745,6 +8837,7 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         crate::copystat::presented();
         self.frames += 1;
+        self.profile_frame();
         #[cfg(feature = "diagnostics")]
         {
             self.copy_stats_frames += 1;
@@ -8848,6 +8941,9 @@ impl Meter {
         let drops = crate::pipeline::take_drops();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
+            for line in victory_core::prof::report() {
+                tracing::info!("{line}");
+            }
             tracing::info!(
                 "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made)",
                 crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)
@@ -9026,6 +9122,7 @@ impl Host {
     /// shown; else, in diagnostics builds, whether the frame was black.
     #[allow(dead_code)]
     pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+        let _p = victory_core::prof_scope!("host.present");
         self.present_planes(texture, state, None, frame)
     }
 
