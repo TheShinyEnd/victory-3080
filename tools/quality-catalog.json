@@ -1,0 +1,783 @@
+{
+ "presets": [
+  "performance",
+  "balanced",
+  "quality",
+  "ultra"
+ ],
+ "groups": [
+  "Resolution & profile",
+  "Lighting & ray tracing",
+  "Textures & memory",
+  "Performance",
+  "Advanced / diagnostics"
+ ],
+ "hooks_built": false,
+ "options": [
+  {
+   "key": "console",
+   "env": "VICTORY_FORCE_CONSOLE",
+   "group": "Resolution & profile",
+   "kind": "choice",
+   "words": [
+    "series-x",
+    "series-s"
+   ],
+   "min": 0,
+   "max": 0,
+   "presets": [
+    "series-s",
+    "series-x",
+    "series-x",
+    "series-x"
+   ],
+   "live": false,
+   "needs_hooks": false,
+   "help": "The game's own console profile. Series S is its low preset (smaller textures, lower detail, 1080p); Series X its high one (2160p).",
+   "cost": "Series S is about 2-3x faster than Series X"
+  },
+  {
+   "key": "display_mode",
+   "env": "VICTORY_DISPLAY_MODE",
+   "group": "Resolution & profile",
+   "kind": "text",
+   "words": [],
+   "min": 0,
+   "max": 0,
+   "presets": [
+    "1920x1080",
+    "1920x1080",
+    "2560x1440",
+    "3840x2160"
+   ],
+   "live": false,
+   "needs_hooks": false,
+   "help": "The screen size the game is told the console is plugged into (WxH, 640x360 to 7680x4320). The game picks its output and render size from it.",
+   "cost": "Cost grows with the pixel count: 1440p is 1.8x and 2160p 4x the pixels of 1080p"
+  },
+  {
+   "key": "adapter",
+   "env": "VICTORY_ADAPTER",
+   "group": "Resolution & profile",
+   "kind": "text",
+   "words": [],
+   "min": 0,
+   "max": 0,
+   "presets": [
+    "",
+    "",
+    "",
+    ""
+   ],
+   "live": false,
+   "needs_hooks": false,
+   "help": "Which graphics card to use on a PC with more than one: part of its name (5060) or #index. Empty: Windows' default card.",
+   "cost": "Pick the strongest card"
+  },
+  {
+   "key": "window_max",
+   "env": "VICTORY_WINDOW_MAX",
+   "group": "Resolution & profile",
+   "kind": "text",
+   "words": [],
+   "min": 0,
+   "max": 0,
+   "presets": [
+    "",
+    "",
+    "",
+    ""
+   ],
+   "live": false,
+   "needs_hooks": false,
+   "help": "Shrinks the game's window to at most WxH (keeps aspect, centred). The picture is stretched: softer, same frame rate. Not a render-resolution setting.",
+   "cost": "None"
+  },
+  {
+   "key": "render_scale",
+   "env": "VICTORY_RENDER_SCALE",
+   "group": "Resolution & profile",
+   "kind": "num",
+   "words": [],
+   "min": 0.2,
+   "max": 1.0,
+   "presets": [
+    "0.5",
+    "0.5",
+    "0.75",
+    "1.0"
+   ],
+   "live": false,
+   "needs_hooks": true,
+   "help": "Game-side: the fraction of the output height the game renders at before its own upscaler (0.2 to 1.0; the hook cannot go above native).",
+   "cost": "Lower is much faster and softer"
+  },
+  {
+   "key": "own_upscaler",
+   "env": "VICTORY_OWN_UPSCALER",
+   "group": "Resolution & profile",
+   "kind": "bool",
+   "words": [],
+   "min": 0,
+   "max": 0,
+   "presets": [
+    "1",
+    "1",
+    "1",
+    ""
+   ],
+   "live": false,
+   "needs_hooks": true,
+   "help": "Game-side: forces the game's own temporal upscaler on (the console profile Series S needs it at any scale below 1).",
+   "cost": "Small cost, hides the lower render scale"
+  },
+  {
+   "key": "ray_miss",
+   "env": "VICTORY_BVH_MISS",
+   "group": "Lighting & ray tracing",
+   "kind": "bool",
+   "words": [],
+   "min": 0,
+   "max": 0,
+   "presets": [
+    "1",
+    "1",
+    "1",
+    "1"
+   ],
+   "live": false,
+   "needs_hooks": false,
+   "help": "Rays end at the root (miss) while the structure builder is off. Off: the title's ray walks run and may hang on stale structures.",
+   "cost": "On is faster and avoids hangs; off needs the structure builder (not available on NVIDIA)"
+  },
+  {
+   "key": "ray_skip",
+   "env": "VICTORY_SKIP_PIPELINES",
+   "group": "Lighting & ray tracing",
+   "kind": "choice",
+   "words": [
+    "none",
+    "list"
+   ],
+   "min": 0,
+   "max": 0,
+   "presets": [
+    "list",
+    "none",
+    "none",
+    "none"
+   ],
+   "live": false,
+   "needs_hooks": false,
+   "help": "list: skip the ~1,034 ray-tracing resolve and traced-shadow shaders of scripts/rt_off_hashes.txt (diagnostics build only). none: run them.",
+   "cost": "list saves GPU time; the skipped passes give less bounced light"
+  },
+  {
+   "key": "ambient",
+   "env": "VICTORY_AMBIENT",
+   "group": "Lighting & ray tracing",
+   "kind": "text",
+   "words": [],
+   "min": 0,
+   "max": 0,
+   "presets": [
+    "0.8",
+    "0.8",
+    "1.0",
+    "1.0"
+   ],
+   "live": true,
+   "needs_hooks": false,
+   "help": "Stand-in for the indirect light the rays would give: this share of an estimate worked out from the frame (0 or off: the title's own, black indoors). Also constant:<level>.",
+   "cost": "Almost free (one small compute pass)"
+  },
+  {
+   "key": "ambient_air",
+   "env": "VICTORY_AMBIENT_AIR",
+   "group": "Lighting & ray tracing",
+   "kind": "num",
+   "words": [],
+   "min": 0.0,
+   "max": 8.0,
+   "presets": [
+    "1.5",
+    "1.5",
+    "1.5",
+    "1.5"
+   ],
+   "live": true,
+   "needs_hooks": false,
+   "help": "Bound for the light the air scatters, as a multiple of the light around (0: the title's own). Lower removes brown fog veils indoors.",
+   "cost": "Free"
+  },
+  {
+   "key": "ambient_most",
+   "env": "VICTORY_AMBIENT_MOST",
+   "group": "Lighting & ray tracing",
+   "kind": "num",
+   "words": [],
+   "min": 0.1,
+   "max": 16.0,
+   "presets": [
+    "2",
+    "2",
+    "2",
+    "2"
+   ],
+   "live": true,
+   "needs_hooks": false,
+   "help": "How many times the estimate the title's own light may keep (4 when unset). Lower stops rooms by a window from glowing.",
+   "cost": "Free"
+  },
+  {
+   "key": "ambient_shade",
+   "env": "VICTORY_AMBIENT_SHADE",
+   "group": "Lighting & ray tracing",
+   "kind": "text",
+   "words": [],
+   "min": 0,
+   "max": 0,
+   "presets": [
+    "",
+    "",
+    "",
+    ""
+   ],
+   "live": false,
+   "needs_hooks": false,
+   "help": "Crease shading of the stand-in: <strength>,<radius in metres> (default 1,0.6).",
+   "cost": "Free"
+  },
+  {
+   "key": "nan_scrub",
+   "env": "VICTORY_NAN_SCRUB",
+   "group": "Lighting & ray tracing",
+   "kind": "bool",
+   "words": [],
+   "min": 0,
+   "max": 0,
+   "presets": [
+    "1",
+    "1",
+    "1",
+    "1"
+   ],
+   "live": false,
+   "needs_hooks": false,
+   "help": "A NaN a shader writes is made 0 before blur and upscaler spread it: removes black blobs. Baked into translated shaders.",
+   "cost": "Tiny cost"
+  },
+  {
+   "key": "residency",
+   "env": "VICTORY_RESIDENCY",
+   "group": "Textures & memory",
+   "kind": "choice",
+   "words": [
+    "auto",
+    "legacy"
+   ],
+   "min": 0,
+   "max": 0,
+   "presets": [
+    "auto",
+    "auto",
+    "auto",
+    "auto"
+   ],
+   "live": false,
+   "needs_hooks": false,
+   "help": "Texture residency policy: auto = the new budgeted policy (floor, reserve, eviction); legacy = the base's rule.",
+   "cost": "auto keeps more detail resident within the card's budget"
+  },
+  {
+   "key": "texture_budget_mb",
+   "env": "VICTORY_TEXTURE_BUDGET_MB",
+   "group": "Textures & memory",
+   "kind": "num",
+   "words": [],
+   "min": 256.0,
+   "max": 65536.0,
+   "presets": [
+    "",
+    "",
+    "",
+    ""
+   ],
+   "live": false,
+   "needs_hooks": false,
+   "help": "Hard cap on host texture copies in MB (legacy residency only). Empty: derived from the card's budget.",
+   "cost": "Higher is sharper but risks spilling card memory into PC RAM (stutter)"
+  },
+  {
+   "key": "texture_cap_mb",
+   "env": "VICTORY_TEXTURE_CAP_MB",
+   "group": "Textures & memory",
+   "kind": "num",
+   "words": [],
+   "min": 0.0,
+   "max": 65536.0,
+   "presets": [
+    "",
+    "",
+    "128",
+    "0"
+   ],
+   "live": false,
+   "needs_hooks": false,
+   "help": "Top mips of a host copy bigger than this are dropped (0: none; empty: the build's default: 8-64 MB by card at 7c0cdf6, off at 28d8475 because a cap banded the picture). Higher keeps more close-up detail.",
+   "cost": "Higher costs video memory (and can spill into PC RAM on small cards); lower fits small cards"
+  },
+  {
+   "key": "residency_reserve_mb",
+   "env": "VICTORY_RESIDENCY_RESERVE_MB",
+   "group": "Textures & memory",
+   "kind": "num",
+   "words": [],
+   "min": 0.0,
+   "max": 65536.0,
+   "presets": [
+    "",
+    "",
+    "",
+    ""
+   ],
+   "live": false,
+   "needs_hooks": false,
+   "help": "Memory the residency policy keeps free for everything else.",
+   "cost": "Higher is safer, textures get less room"
+  },
+  {
+   "key": "residency_floor_mb",
+   "env": "VICTORY_RESIDENCY_FLOOR_MB",
+   "group": "Textures & memory",
+   "kind": "num",
+   "words": [],
+   "min": 0.0,
+   "max": 65536.0,
+   "presets": [
+    "",
+    "",
+    "",
+    ""
+   ],
+   "live": false,
+   "needs_hooks": false,
+   "help": "Texture bytes always admitted whatever the memory use.",
+   "cost": "Higher keeps more detail under pressure"
+  },
+  {
+   "key": "residency_stage_mb",
+   "env": "VICTORY_RESIDENCY_STAGE_MB",
+   "group": "Textures & memory",
+   "kind": "num",
+   "words": [],
+   "min": 16.0,
+   "max": 1024.0,
+   "presets": [
+    "",
+    "",
+    "",
+    ""
+   ],
+   "live": false,
+   "needs_hooks": false,
+   "help": "Texture MB staged to the card per frame under the new policy (automatic: 48-192 MB by card).",
+   "cost": "Higher fills textures faster, longer frames"
+  },
+  {
+   "key": "texture_stage_mb",
+   "env": "VICTORY_TEXTURE_STAGE_MB",
+   "group": "Textures & memory",
+   "kind": "num",
+   "words": [],
+   "min": 0.0,
+   "max": 4096.0,
+   "presets": [
+    "",
+    "",
+    "",
+    ""
+   ],
+   "live": true,
+   "needs_hooks": false,
+   "help": "Texture MB uploaded per frame (empty: automatic). Higher drains the first minutes of black surfaces sooner.",
+   "cost": "Higher: faster fill, hitchier frames"
+  },
+  {
+   "key": "texture_no_wait",
+   "env": "VICTORY_TEXTURE_NO_WAIT",
+   "group": "Textures & memory",
+   "kind": "choice",
+   "words": [
+    "wait",
+    "no-wait",
+    "no-wait-all"
+   ],
+   "min": 0,
+   "max": 0,
+   "presets": [
+    "no-wait",
+    "wait",
+    "wait",
+    "wait"
+   ],
+   "live": false,
+   "needs_hooks": false,
+   "help": "Whether texture refreshes wait for the title's memory to hold still. wait: correct skin/materials; no-wait: faster, can show rainbow skin.",
+   "cost": "no-wait saves about 7 fps"
+  },
+  {
+   "key": "upload_ahead",
+   "env": "VICTORY_UPLOAD_AHEAD",
+   "group": "Textures & memory",
+   "kind": "bool",
+   "words": [],
+   "min": 0,
+   "max": 0,
+   "presets": [
+    "1",
+    "1",
+    "1",
+    "1"
+   ],
+   "live": false,
+   "needs_hooks": false,
+   "help": "Upload textures ahead of the draw lists that use them (less pop-in).",
+   "cost": "Slightly less hitching"
+  },
+  {
+   "key": "relay",
+   "env": "VICTORY_RELAY",
+   "group": "Performance",
+   "kind": "choice",
+   "words": [
+    "0",
+    "1",
+    "2"
+   ],
+   "min": 0,
+   "max": 0,
+   "presets": [
+    "2",
+    "2",
+    "1",
+    "1"
+   ],
+   "live": false,
+   "needs_hooks": false,
+   "help": "Relay stage for the title's copies. 1: correct bodies (no stretched or jumping characters); 2: faster.",
+   "cost": "Stage 1 costs about 7 fps with card steps 0"
+  },
+  {
+   "key": "card_steps",
+   "env": "VICTORY_CARD_STEPS",
+   "group": "Performance",
+   "kind": "choice",
+   "words": [
+    "0",
+    "1",
+    "2"
+   ],
+   "min": 0,
+   "max": 0,
+   "presets": [
+    "2",
+    "2",
+    "0",
+    "0"
+   ],
+   "live": false,
+   "needs_hooks": false,
+   "help": "Card-side steps of the relay. 0: correct bodies; 2: fastest.",
+   "cost": "0 costs the submitting thread about 30 ms a frame"
+  },
+  {
+   "key": "pipeline_wait_ms",
+   "env": "VICTORY_PIPELINE_WAIT_MS",
+   "group": "Performance",
+   "kind": "num",
+   "words": [],
+   "min": 0.0,
+   "max": 120000.0,
+   "presets": [
+    "10000",
+    "10000",
+    "10000",
+    "10000"
+   ],
+   "live": true,
+   "needs_hooks": false,
+   "help": "Milliseconds a frame may wait for new shader pipelines to compile instead of skipping their draws (default 500). Higher: fewer missing objects, longer first-time hitches.",
+   "cost": "Only costs time the first time a place is seen"
+  },
+  {
+   "key": "dynamic_slots",
+   "env": "VICTORY_DYNAMIC_SLOTS",
+   "group": "Performance",
+   "kind": "num",
+   "words": [],
+   "min": 1024.0,
+   "max": 1000000.0,
+   "presets": [
+    "524288",
+    "524288",
+    "524288",
+    "524288"
+   ],
+   "live": false,
+   "needs_hooks": false,
+   "help": "Descriptor slots for dynamic views. Too few drops draws (missing objects) on cards capped at 1,000,000.",
+   "cost": "None"
+  },
+  {
+   "key": "card_buffers_mb",
+   "env": "VICTORY_CARD_BUFFERS_MB",
+   "group": "Performance",
+   "kind": "num",
+   "words": [],
+   "min": 0.0,
+   "max": 16384.0,
+   "presets": [
+    "1024",
+    "1024",
+    "1024",
+    "1024"
+   ],
+   "live": false,
+   "needs_hooks": false,
+   "help": "Video memory for card-side copies of the title's buffers (memory compares on the card, not the CPU: about 2x fps on Series S).",
+   "cost": "Larger is faster until memory runs out"
+  },
+  {
+   "key": "zero_copy",
+   "env": "VICTORY_UMA",
+   "group": "Performance",
+   "kind": "bool",
+   "words": [],
+   "min": 0,
+   "max": 0,
+   "presets": [
+    "",
+    "",
+    "",
+    ""
+   ],
+   "live": false,
+   "needs_hooks": false,
+   "help": "Zero-copy memory on integrated or unified-memory GPUs.",
+   "cost": "Faster only on shared-memory hardware"
+  },
+  {
+   "key": "texture_room_percent",
+   "env": "VICTORY_TEXTURE_ROOM_PERCENT",
+   "group": "Textures & memory",
+   "kind": "num",
+   "words": [],
+   "min": 50.0,
+   "max": 97.0,
+   "presets": [
+    "",
+    "",
+    "",
+    ""
+   ],
+   "live": false,
+   "needs_hooks": false,
+   "help": "Legacy residency only: the share of card memory textures may fill (default 90).",
+   "cost": "Higher keeps more textures, risks spilling into PC RAM"
+  },
+  {
+   "key": "texture_keep",
+   "env": "VICTORY_TEXTURE_KEEP",
+   "group": "Textures & memory",
+   "kind": "choice",
+   "words": [
+    "keep",
+    "release-early"
+   ],
+   "min": 0,
+   "max": 0,
+   "presets": [
+    "keep",
+    "keep",
+    "keep",
+    "keep"
+   ],
+   "live": false,
+   "needs_hooks": false,
+   "help": "keep: idle texture copies stay up to 10 minutes while memory is free; release-early: dropped after 5 s.",
+   "cost": "release-early saves memory, causes re-uploads"
+  },
+  {
+   "key": "levels_on_demand",
+   "env": "VICTORY_LEVELS_ON_DEMAND",
+   "group": "Textures & memory",
+   "kind": "bool",
+   "words": [],
+   "min": 0,
+   "max": 0,
+   "presets": [
+    "",
+    "",
+    "",
+    ""
+   ],
+   "live": false,
+   "needs_hooks": false,
+   "help": "Copies of textures are made level by level on demand (needs tiled-resources tier 2). Saves memory.",
+   "cost": "Saves memory, small CPU cost"
+  },
+  {
+   "key": "map_threads",
+   "env": "VICTORY_MAP_THREADS",
+   "group": "Performance",
+   "kind": "num",
+   "words": [],
+   "min": 1.0,
+   "max": 32.0,
+   "presets": [
+    "",
+    "",
+    "",
+    ""
+   ],
+   "live": false,
+   "needs_hooks": false,
+   "help": "Threads that map the title's memory (empty: 8).",
+   "cost": "More can help streaming, costs CPU"
+  },
+  {
+   "key": "pipeline_workers",
+   "env": "VICTORY_PIPELINE_WORKERS",
+   "group": "Performance",
+   "kind": "num",
+   "words": [],
+   "min": 1.0,
+   "max": 64.0,
+   "presets": [
+    "",
+    "",
+    "",
+    ""
+   ],
+   "live": false,
+   "needs_hooks": false,
+   "help": "Threads that compile shader pipelines (empty: two thirds of the cores).",
+   "cost": "More shortens first-time hitches, takes CPU from the game"
+  },
+  {
+   "key": "rt_resolve",
+   "env": "VICTORY_RT_RESOLVE",
+   "group": "Lighting & ray tracing",
+   "kind": "bool",
+   "words": [],
+   "min": 0,
+   "max": 0,
+   "presets": [
+    "",
+    "",
+    "",
+    ""
+   ],
+   "live": false,
+   "needs_hooks": false,
+   "help": "Keep the ~1,000 ray-tracing resolve shaders instead of leaving them out while the structure builder is off.",
+   "cost": "Costs GPU time; the light they give is wrong without structures"
+  },
+  {
+   "key": "bvh_builder",
+   "env": "VICTORY_BVH_BUILDER",
+   "group": "Lighting & ray tracing",
+   "kind": "bool",
+   "words": [],
+   "min": 0,
+   "max": 0,
+   "presets": [
+    "",
+    "",
+    "",
+    ""
+   ],
+   "live": false,
+   "needs_hooks": false,
+   "help": "EXPERIMENTAL: builds the ray-tracing structures. Cannot run on NVIDIA cards (64-lane programs refused).",
+   "cost": "Large cost; may hang"
+  },
+  {
+   "key": "f16_nearest",
+   "env": "VICTORY_F16_NEAREST",
+   "group": "Advanced / diagnostics",
+   "kind": "bool",
+   "words": [],
+   "min": 0,
+   "max": 0,
+   "presets": [
+    "",
+    "",
+    "",
+    ""
+   ],
+   "live": false,
+   "needs_hooks": false,
+   "help": "Exact half-float rounding in translated shaders. Baked into shaders: the first run re-translates everything.",
+   "cost": "Extra instructions"
+  },
+  {
+   "key": "panel",
+   "env": "VICTORY_PANEL",
+   "group": "Advanced / diagnostics",
+   "kind": "bool",
+   "words": [],
+   "min": 0,
+   "max": 0,
+   "presets": [
+    "",
+    "",
+    "",
+    ""
+   ],
+   "live": false,
+   "needs_hooks": false,
+   "help": "Shows the numbers panel (F3 toggles). F8 opens the quality page whether or not this is on.",
+   "cost": "About 50 microseconds a frame"
+  },
+  {
+   "key": "profile",
+   "env": "VICTORY_PROFILE",
+   "group": "Advanced / diagnostics",
+   "kind": "bool",
+   "words": [],
+   "min": 0,
+   "max": 0,
+   "presets": [
+    "",
+    "",
+    "",
+    ""
+   ],
+   "live": false,
+   "needs_hooks": false,
+   "help": "Scoped timers and a stall report at the end of the run.",
+   "cost": "A few percent"
+  },
+  {
+   "key": "gpu_timing",
+   "env": "VICTORY_GPU_TIMING",
+   "group": "Advanced / diagnostics",
+   "kind": "bool",
+   "words": [],
+   "min": 0,
+   "max": 0,
+   "presets": [
+    "",
+    "",
+    "",
+    ""
+   ],
+   "live": false,
+   "needs_hooks": false,
+   "help": "GPU timestamps per pass for the numbers panel and profile.",
+   "cost": "A few percent"
+  }
+ ]
+}

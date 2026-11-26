@@ -94,7 +94,19 @@ fn parse(set: &str) -> Set {
 
 fn set() -> Set {
     static SET: OnceLock<Set> = OnceLock::new();
+    // The quality page (`crate::live`) may have changed the share since the start.
+    if let Some(v) = crate::live::ambient() {
+        return if v > 0.0 { Set::Estimate(v) } else { Set::Off };
+    }
     *SET.get_or_init(|| parse(&std::env::var("VICTORY_AMBIENT").unwrap_or_default()))
+}
+
+/// The share of the estimate now in use (0: off; a constant shows as 0 here, the page then replaces it).
+pub(crate) fn share_now() -> f32 {
+    match set() {
+        Set::Estimate(v) => v,
+        _ => 0.0,
+    }
 }
 
 /// Whether the stand-in is on: set, and the title's rays find nothing.
@@ -104,8 +116,11 @@ pub(crate) fn on() -> bool {
 
 /// The most the air scatters, as a multiple of the light around
 /// (`VICTORY_AMBIENT_AIR=<multiple>`; unset or 0: what the title has).
-fn air() -> f32 {
+pub(crate) fn air() -> f32 {
     static SET: OnceLock<f32> = OnceLock::new();
+    if let Some(v) = crate::live::air() {
+        return v;
+    }
     *SET.get_or_init(|| {
         let set = std::env::var("VICTORY_AMBIENT_AIR").unwrap_or_default();
         set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(0.0)
@@ -116,8 +131,11 @@ fn air() -> f32 {
 /// (`VICTORY_AMBIENT_MOST=<multiple>`, 4 when unset). Without rays the
 /// probes hold the sky's light indoors too; at 4 times the estimate a room
 /// looked towards a window or the sky goes very bright.
-fn most() -> f32 {
+pub(crate) fn most() -> f32 {
     static SET: OnceLock<f32> = OnceLock::new();
+    if let Some(v) = crate::live::most() {
+        return v;
+    }
     *SET.get_or_init(|| {
         let set = std::env::var("VICTORY_AMBIENT_MOST").unwrap_or_default();
         set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(4.0)

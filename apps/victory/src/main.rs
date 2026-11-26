@@ -5,6 +5,7 @@
 
 mod census;
 mod inspect;
+mod quality;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod replay;
 mod run;
@@ -153,6 +154,8 @@ enum Command {
     Replay(replay::Replay),
     /// Show the resolved configuration and check it.
     Config,
+    /// Show or change `quality.toml`: the picture and speed options and their presets.
+    Quality(quality::Args),
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -169,6 +172,10 @@ enum Console {
 
 fn main() -> Result<()> {
     victory_core::logging::init("info");
+    // `quality.toml` becomes `VICTORY_*` variables (those already set win) before anything reads them.
+    if !std::env::args().nth(1).is_some_and(|a| a == "quality") {
+        victory_core::quality::apply();
+    }
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if victory_hle::modules::audio::capture::child() {
@@ -232,6 +239,7 @@ fn main() -> Result<()> {
         #[cfg(all(windows, feature = "diagnostics"))]
         Command::Replay(options) => replay::run(options),
         Command::Config => show_config(),
+        Command::Quality(args) => quality::run(args),
     }
 }
 

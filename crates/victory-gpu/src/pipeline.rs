@@ -794,6 +794,12 @@ mod library;
 #[cfg(windows)]
 mod make;
 
+/// Milliseconds a frame may wait for new pipelines now (the quality page may have changed it).
+#[cfg(windows)]
+pub(crate) fn wait_budget_ms() -> u64 {
+    make::wait_budget().as_millis() as u64
+}
+
 /// Lets the pipeline library's mapped file go from memory when no pipeline
 /// has loaded for a while (`library::trim`); called by the host's sweep.
 #[cfg(windows)]

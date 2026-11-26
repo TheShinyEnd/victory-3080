@@ -231,8 +231,12 @@ pub(crate) fn hashes(p: &Pending) -> String {
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
 /// Waiting allowed per title frame, over all threads.
-fn wait_budget() -> Duration {
+pub(crate) fn wait_budget() -> Duration {
     static BUDGET: OnceLock<Duration> = OnceLock::new();
+    // The quality page (`crate::live`) may have changed it since the start.
+    if let Some(ms) = crate::live::wait_ms() {
+        return Duration::from_millis(ms);
+    }
     *BUDGET.get_or_init(|| {
         let millis = std::env::var("VICTORY_PIPELINE_WAIT_MS")
             .ok()

@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_F3};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_DOWN, VK_F3, VK_F8, VK_LEFT, VK_RIGHT, VK_UP};
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
 use super::{Host, HostList, transition};
@@ -45,18 +45,39 @@ fn shown() -> &'static AtomicBool {
     SHOWN.get_or_init(|| AtomicBool::new(asked()))
 }
 
-/// F3 was pressed since the last call, with one of our windows in front.
-fn pressed() -> bool {
-    static DOWN: AtomicBool = AtomicBool::new(false);
+/// The key `vk` went down since the last call with the same `was`, with one of our windows in front.
+fn key_pressed(vk: u16, was: &AtomicBool) -> bool {
     // SAFETY: a plain query.
-    let down = unsafe { GetAsyncKeyState(i32::from(VK_F3)) } < 0;
-    if DOWN.swap(down, Ordering::Relaxed) || !down {
+    let down = unsafe { GetAsyncKeyState(i32::from(vk)) } < 0;
+    if was.swap(down, Ordering::Relaxed) || !down {
         return false;
     }
     let mut process = 0;
     // SAFETY: plain queries; room for the answer.
     unsafe { GetWindowThreadProcessId(GetForegroundWindow(), &mut process) };
     process == std::process::id()
+}
+
+/// F3 was pressed since the last call, with one of our windows in front.
+fn pressed() -> bool {
+    static DOWN: AtomicBool = AtomicBool::new(false);
+    key_pressed(VK_F3, &DOWN)
+}
+
+/// F8 (not F10, which Windows gives to the window's system menu, and not F9, the frame capture's) opens and closes the quality page.
+fn menu_pressed() -> bool {
+    static DOWN: AtomicBool = AtomicBool::new(false);
+    key_pressed(VK_F8, &DOWN)
+}
+
+/// Which of the page's keys went down: up, down, left, right.
+fn page_keys() -> [bool; 4] {
+    static DOWN: [AtomicBool; 4] = [const { AtomicBool::new(false) }; 4];
+    let mut out = [false; 4];
+    for (i, vk) in [VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT].into_iter().enumerate() {
+        out[i] = key_pressed(vk, &DOWN[i]);
+    }
+    out
 }
 
 /// Seven rows of five dots, the leftmost the highest bit.
@@ -102,6 +123,8 @@ const fn glyph(c: u8) -> [u8; 7] {
         b'.' => [0, 0, 0, 0, 0, 0b01100, 0b01100],
         b'/' => [0b00001, 0b00010, 0b00010, 0b00100, 0b01000, 0b01000, 0b10000],
         b'-' => [0, 0, 0, 0b11111, 0, 0, 0],
+        b'>' => [0b10000, 0b01000, 0b00100, 0b00010, 0b00100, 0b01000, 0b10000],
+        b':' => [0, 0b01100, 0b01100, 0, 0b01100, 0b01100, 0],
         b' ' => [0; 7],
         _ => [0b11111, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11111],
     }
@@ -294,6 +317,8 @@ pub(super) struct Panel {
     changed: bool,
     buffers: Option<Buffers>,
     failed: bool,
+    /// The quality page is open (F8): it replaces the numbers while it is.
+    page: Option<crate::live::Menu>,
 }
 
 impl Panel {
@@ -310,6 +335,7 @@ impl Panel {
             changed: false,
             buffers: None,
             failed: false,
+            page: None,
         }
     }
 
@@ -318,6 +344,39 @@ impl Panel {
     pub(super) fn frame(&mut self, line: bool) {
         if pressed() {
             shown().fetch_xor(true, Ordering::Relaxed);
+        }
+        if menu_pressed() {
+            if self.page.take().is_some() {
+                // (Closed: the numbers' own state comes back.)
+                shown().store(asked(), Ordering::Relaxed);
+                self.lines.clear();
+                self.frames = 0;
+            } else {
+                self.page = Some(crate::live::Menu::default());
+                shown().store(true, Ordering::Relaxed);
+                self.changed = true;
+            }
+        }
+        if let Some(page) = &mut self.page {
+            let [up, down, left, right] = page_keys();
+            if up {
+                page.up();
+            }
+            if down {
+                page.down();
+            }
+            if left {
+                page.change(-1);
+            }
+            if right {
+                page.change(1);
+            }
+            let lines = page.lines();
+            if lines != self.lines {
+                self.lines = lines;
+                self.changed = true;
+            }
+            return;
         }
         if !shown().load(Ordering::Relaxed) {
             self.frames = 0;
@@ -431,7 +490,7 @@ mod tests {
     /// alike.
     #[test]
     fn characters_differ() {
-        let used: Vec<u8> = (b'0'..=b'9').chain(b'A'..=b'Z').chain(*b"./- ").collect();
+        let used: Vec<u8> = (b'0'..=b'9').chain(b'A'..=b'Z').chain(*b"./- >:").collect();
         for (i, a) in used.iter().enumerate() {
             assert_ne!(glyph(*a), glyph(b'#'), "{} has a picture", *a as char);
             assert!(glyph(*a).iter().all(|row| row >> GLYPH.0 == 0));

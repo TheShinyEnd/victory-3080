@@ -2542,6 +2542,12 @@ impl State {
         let asked = *PER_FRAME_MB.get_or_init(|| {
             std::env::var("VICTORY_TEXTURE_STAGE_MB").ok().and_then(|v| v.trim().parse::<u64>().ok())
         });
+        // The quality page (`crate::live`) may have set another: 0 is the automatic budget.
+        let asked = match crate::live::stage_mb() {
+            Some(0) => None,
+            Some(mb) => Some(mb),
+            None => asked,
+        };
         let per_frame = match asked {
             Some(mb) => mb << 20,
             None => {
