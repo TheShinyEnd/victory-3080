@@ -2375,7 +2375,15 @@ impl<'a> Lower<'a> {
             self.s.entry = body;
         }
         self.find_coherent();
-        self.halves_only = self.places_read_as_halves();
+        // v7: VIctory-NVIDIA's halves path (host shows the unsigned twin of a
+        // 16-bit float/signed table view) is opt-in, `VICTORY_HALVES=1`;
+        // by default cool_fox's runtime integer_view (SLOT_TABLE_STRIDES)
+        // does the same job (its tests pin that). Part of nothing cached
+        // unless switched on: do not flip it on a warm shader cache.
+        static HALVES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *HALVES.get_or_init(|| std::env::var_os("VICTORY_HALVES").is_some_and(|v| v == "1")) {
+            self.halves_only = self.places_read_as_halves();
+        }
         let order = crate::ir::reverse_postorder(&p.blocks);
         for (n, &b) in order.iter().enumerate() {
             self.rpo[b] = n;
