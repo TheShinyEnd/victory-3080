@@ -2872,6 +2872,31 @@ fn flying() -> bool {
     line.settling || line.line.iter().any(|l| matches!(l, Late::Run(_)))
 }
 
+/// Whether a submission's one write-watch asking (`VICTORY_ASK_ONCE`) also
+/// covers the memory of the staged textures its lists sample
+/// (`VICTORY_WATCH_TEXTURES_JOINED=1`; off by default).
+///
+/// After KevinPratap's public tree, commit 4d53d196: run batch7 there had
+/// 392 GetWriteWatch calls a frame, 223 of them from texture refreshes (for
+/// 38,000 pages), each texture asked on its own. Joined, neighbouring
+/// textures are one asking (`watch::ask_ahead`'s gap rule, or one per
+/// allocation with `VICTORY_WATCH_RESERVATION`), and each texture's
+/// `watch::writes` finds its range among those asked ahead and answers from
+/// the journal. View memory is left out of the asking as for any range
+/// (`published`, `refused_as_view`).
+fn textures_joined() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_WATCH_TEXTURES_JOINED") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WATCH_TEXTURES_JOINED").is_some_and(|v| v == "1"))
+}
+
+/// With [`textures_joined`], since the last frame line: texture ranges put
+/// into submissions' one asking.
+static TEXTURES_ASKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// With flights in the air ([`late`]): why `runs` cannot be prepared
 /// before they are settled, if so. Preparing reads title memory on the
 /// CPU (the title's buffer copies, fills of upload memory, textures) and
@@ -3817,6 +3842,15 @@ fn late_line(frames: f64) {
         );
     }
     card_steps::log(frames);
+    {
+        let textures = TEXTURES_ASKED.swap(0, Ordering::Relaxed) as f64 / frames;
+        if textures_joined() {
+            tracing::info!(
+                "staged textures put into submissions' one write-watch asking per frame (VICTORY_WATCH_TEXTURES_JOINED=1): {textures:.0}"
+            );
+        }
+    }
+    crate::watch::guard_bits_line(frames);
     crate::picked::log(frames);
     #[cfg(feature = "diagnostics")]
     log_blame(frames);
@@ -5934,7 +5968,24 @@ impl Host {
                     }
                 }
             }
-            let ranges: Vec<(usize, usize)> = spans.into_values().collect();
+            let mut ranges: Vec<(usize, usize)> = spans.into_values().collect();
+            // The staged textures its lists sample, asked with the rest
+            // (`textures_joined`): their refreshes then find the answer in
+            // the journal instead of asking the kernel one by one.
+            if textures_joined() {
+                let before = ranges.len();
+                for list in runs {
+                    for step in &list.deferred().copies {
+                        if let Step::Texture(staging) = step {
+                            let (at, len) = staging.memory();
+                            if len > 0 {
+                                ranges.push((at, at + len));
+                            }
+                        }
+                    }
+                }
+                TEXTURES_ASKED.fetch_add((ranges.len() - before) as u64, Ordering::Relaxed);
+            }
             #[cfg(feature = "diagnostics")]
             SPLIT[8].fetch_add(split.so_far(), Ordering::Relaxed);
             stage.next("submit: asking the write watch");

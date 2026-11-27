@@ -380,7 +380,30 @@ fn take(state: &mut State) -> Option<(Work, usize)> {
 /// [`Pool::each`] on the threads kept for landing.
 pub(crate) fn each(count: usize, f: &(dyn Fn(usize) + Sync)) {
     static POOL: OnceLock<&'static Pool> = OnceLock::new();
+    // With `VICTORY_LAND_WIDE=1` (off by default; named in `VICTORY_AB` it is
+    // on in some phases): the jobs go to a second pool of
+    // `VICTORY_LAND_WIDE_THREADS` (8, this thread's counted) threads, made at
+    // the first landing that finds the switch on. Off: the pool above, as before.
+    if wide_on() {
+        static WIDE: OnceLock<&'static Pool> = OnceLock::new();
+        WIDE.get_or_init(|| {
+            let n = std::env::var("VICTORY_LAND_WIDE_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8usize);
+            Pool::new("victory-land", n.clamp(2, 16))
+        })
+        .each(count, f);
+        return;
+    }
     POOL.get_or_init(|| Pool::new("victory-land", threads())).each(count, f);
+}
+
+/// `VICTORY_LAND_WIDE` ([`each`]).
+fn wide_on() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_LAND_WIDE") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_WIDE").is_some_and(|v| v == "1"))
 }
 
 /// [`Pool::each`] on threads kept for the title's bytes under flights' writes
