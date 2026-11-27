@@ -81,7 +81,7 @@ Not pipelines. A pool of ten workers finishes all of them before the first world
 
 Each camera cut remaps and rebinds a whole scene while the card is still full from the previous shot:
 
-- Textures queue at the admission line for about a minute with 100 to 400 MB missing while 700 to 900 MB of the card is free. Raising the line briefly when textures are stuck cut missing-texture time by 88 % in one pair of runs. That change is not merged yet.
+- Textures queue at the admission line for about a minute with 100 to 400 MB missing while 700 to 900 MB of the card is free. Raising the line briefly when textures are stuck (`VICTORY_BACKLOG_ROOM=4`) cut missing-texture time by 88 % in one pair of runs, for about 50 MB more card memory. It is in the tree but off by default, because one pair of runs is not enough to turn it on for everyone.
 - The title's threads spend 15 to 70 times longer in the memory mapping calls than in the world: over 4,000 per-page map calls a second, 160 to 300 microseconds each, about a millisecond when the address space lock is contended.
 
 ## The idea I have not finished

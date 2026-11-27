@@ -9328,6 +9328,22 @@ impl Meter {
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         #[cfg(feature = "diagnostics")]
         crate::copystat::presented();
+        // `VICTORY_PRESENT_SLEEP_MS=n` with `VICTORY_PRESENT_SLEEP_AFTER=k` (an experiment, stream3): from the
+        // k-th present on, each present holds the title's thread n milliseconds more, to tell whether what
+        // the title streams depends on frames or on seconds (the frame clock's own wait is not used
+        // with VICTORY_FPS above 30).
+        {
+            static PRESENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            static SLEEP: OnceLock<(u64, u64)> = OnceLock::new();
+            let (ms, after) = *SLEEP.get_or_init(|| {
+                let get = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0);
+                (get("VICTORY_PRESENT_SLEEP_MS"), get("VICTORY_PRESENT_SLEEP_AFTER"))
+            });
+            let n = PRESENTS.fetch_add(1, Ordering::Relaxed) + 1;
+            if ms > 0 && n >= after {
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+            }
+        }
         self.frames += 1;
         self.profile_frame();
         #[cfg(feature = "diagnostics")]
@@ -9356,6 +9372,7 @@ impl Meter {
             COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
         });
         let dropped = crate::draw::take_dropped() as f64 / frames;
+        crate::arrival::second_line(frames, fps, draws, ms);
         let indirect = crate::list::take_indirect() as f64 / frames;
         let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
         let mesh_groups = MESH_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;

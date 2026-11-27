@@ -1931,6 +1931,14 @@ pub(crate) fn room_lately() -> bool {
 /// and 94 gives the textures about that much back.
 #[cfg(windows)]
 fn room_percent() -> u64 {
+    // While textures are really missing and the card has stood at its line for a
+    // while (a cutscene's cut binds thousands at once: `crate::arrival`), the line
+    // is a few percent higher; the base is the setting's.
+    room_percent_base() + crate::arrival::line_bonus_percent()
+}
+
+#[cfg(windows)]
+fn room_percent_base() -> u64 {
     static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *PERCENT.get_or_init(|| {
         std::env::var("VICTORY_TEXTURE_ROOM_PERCENT")

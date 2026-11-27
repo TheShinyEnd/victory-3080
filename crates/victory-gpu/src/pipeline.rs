@@ -554,15 +554,52 @@ pub(crate) fn note_drop(this: This) {
         skipped_shader(p)
             .map(|hash| format!("skipped shader {hash}"))
             .or_else(|| make::missing(&p.host))
+            // Never queued (queue state 0: the ray-tracing builder's programs, off by
+            // design, or pipelines the title made and never drew with before): a kind of its own.
+            .map(|why| {
+                if why == "being made" && make::why_dropped(&p.host).contains("queue state 0,") {
+                    "not requested (queue state 0)".to_owned()
+                } else {
+                    why
+                }
+            })
     };
     if let Some(why) = why {
         note_why(why);
     }
 }
 
+/// Drops by kind since [`take_drop_kinds`]: the pipeline is being made (queued or
+/// compiling), the pipeline will never be made (a shader that does not translate,
+/// refused), others (no pipeline set, ray-tracing builder off, left out).
+#[cfg(all(windows, feature = "diagnostics"))]
+static DROP_KINDS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// The drops by kind since the last call (the per-second line of `crate::arrival`).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn take_drop_kinds() -> [u64; 4] {
+    [0, 1, 2, 3].map(|i| DROP_KINDS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Pipelines made and loaded from the library since the start.
+#[cfg(windows)]
+pub(crate) fn library_counts() -> [u64; 2] {
+    [library::MADE.load(std::sync::atomic::Ordering::Relaxed), library::LOADED.load(std::sync::atomic::Ordering::Relaxed)]
+}
+
 /// Counts a draw or dispatch dropped for `why` (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn note_why(why: String) {
+    let kind = if why.starts_with("being made") {
+        0
+    } else if why.starts_with("not requested") || why.starts_with("a stage of the ray") {
+        3
+    } else if why.starts_with("no pipeline set") || why.starts_with("left out") || why.starts_with("a stage of the ray") || why.starts_with("skipped") {
+        2
+    } else {
+        1
+    };
+    DROP_KINDS[kind].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     crate::capture::op(0, || format!("DROPPED {why}"));
     let mut drops = DROPS.lock().unwrap_or_else(|e| e.into_inner());
     *drops.get_or_insert_with(HashMap::new).entry(why).or_default() += 1;
