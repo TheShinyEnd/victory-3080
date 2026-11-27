@@ -168,6 +168,16 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
     }
 }
 
+/// Every how many world frames a picture is saved with
+/// `VICTORY_CAPTURE_WORLD` (`VICTORY_CAPTURE_WORLD_EVERY`, default 32; it
+/// was every 8th, which wrote about 130 GB of test pictures in two days).
+fn world_every() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_CAPTURE_WORLD_EVERY").ok().and_then(|v| v.trim().parse().ok()).filter(|n| *n > 0).unwrap_or(32)
+    })
+}
+
 /// Whether frame `n` is saved.
 pub(crate) fn wanted(n: u64) -> bool {
     // Before the world, with `VICTORY_CAPTURE_WORLD`: every 16th frame too
@@ -177,7 +187,7 @@ pub(crate) fn wanted(n: u64) -> bool {
     // cutscene (its shots do not fall on the same frame numbers from run to
     // run, so single frames cannot be compared between runs).
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
-    let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(8);
+    let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(world_every());
     folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world)
 }
 
