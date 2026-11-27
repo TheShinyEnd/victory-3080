@@ -8,6 +8,14 @@ This is a fork of [VIctory](https://github.com/Marvisak/VIctory), the compatibil
 
 I'm putting it up because of the notes, not because of the frame rate. If you want the fastest build, this isn't it.
 
+## Why this is taking a while
+
+The console has one pool of memory (unified memory) that the CPU and GPU share. The game writes something and the graphics chip just sees it. A PC with a separate graphics card has two pools, system memory and VRAM, so every frame the layer has to work out what the game changed, copy it to the card, and copy results back. The game never says what it changed, because on a console it never needed to. That bookkeeping is most of the frame time, not the graphics work. On my 3080 the GPU sits nearly idle.
+
+That is also most of why numbers differ so much between people. A faster CPU helps a lot. Some AMD setups can let the GPU read the game's memory directly, which is much slower on NVIDIA. And many of the higher numbers come from rendering at a lower resolution and upscaling.
+
+Resizable BAR might offer a way around part of it on NVIDIA. I have measured that it is fast enough in principle, but nobody has it working yet, me included. It is not impossible. It just needs more development than most people expected.
+
 ## Where it actually stands
 
 | | |
