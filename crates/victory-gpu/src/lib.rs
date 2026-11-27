@@ -16,6 +16,10 @@
 //! `present` (swap chain).
 
 #[cfg(windows)]
+mod accessprobe;
+#[cfg(windows)]
+mod lazy;
+#[cfg(windows)]
 mod ambient;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;

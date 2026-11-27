@@ -4195,7 +4195,106 @@ impl Shadow {
 
     /// Offsets `[from, to)` go up again whole, as the CPU's side has them.
     pub(crate) fn resend(&self, from: usize, to: usize) {
+        // (A deferred range holds old bytes here: they must not go up.)
+        crate::lazy::resolve_shadow(self, from, to, crate::lazy::Why::Resend);
         self.card_changed(from, to);
+    }
+
+    /// For `crate::lazy`: a copy in the card's memory that is not a window
+    /// and not in place.
+    pub(crate) fn lazy_card(&self) -> bool {
+        self.card.is_some() && self.place.is_none() && !self.window
+    }
+
+    /// For `crate::lazy`: no byte of `[lo, hi)` waits to go up to the card or
+    /// went up after send `behind` (the title's bytes there are newer than a
+    /// fetch's, as `land_card` leaves them out).
+    pub(crate) fn lazy_nothing_waiting(&self, lo: usize, hi: usize, behind: u64) -> bool {
+        let Some(card) = &self.card else {
+            return false;
+        };
+        if hi > self.len as usize {
+            return false;
+        }
+        let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+        if dirty.iter().any(|&(a, b)| a < hi && b > lo) {
+            return false;
+        }
+        let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
+        let mut near = Vec::new();
+        sent.near(behind, lo, hi, &mut near);
+        near.is_empty()
+    }
+
+    /// For `crate::lazy`'s resolve, on any thread and without waiting:
+    /// whether bytes of `[lo, hi)` wait to go up to the card (the lock asked
+    /// once; if it is held, taken as no). No allocation.
+    pub(crate) fn lazy_dirty_overlaps(&self, lo: usize, hi: usize) -> bool {
+        let Some(card) = &self.card else {
+            return false;
+        };
+        match card.dirty.try_lock() {
+            Ok(dirty) => dirty.iter().any(|&(a, b)| a < hi && b > lo),
+            Err(_) => false,
+        }
+    }
+
+    /// For `crate::lazy`: a resolve put the card's bytes of `[lo, hi)` into
+    /// title memory (as `land_card` notes a landing).
+    pub(crate) fn lazy_landed(&self, lo: usize, hi: usize) {
+        self.note_landing(lo, hi);
+    }
+
+    /// For `crate::lazy`: whether no other copy (title buffer or window) and
+    /// no placed texture lies over title memory `[at, at + len)`. (Looked
+    /// for among the 256 buffers that start below, as `lookup` does; placed
+    /// textures that start up to 16 MiB below: an approximation.)
+    /// (0: alone, 1: another copy, 2: a placed texture.)
+    /// `block` is a title address of the 64 KiB block (an alias, or the
+    /// block itself) whose bytes this copy holds at `primary`: only what
+    /// overlaps this copy's own bytes of it counts.
+    pub(crate) fn lazy_alone(&self, block: u64, primary: u64) -> u8 {
+        let (lo, hi) = (self.start.max(primary) - primary, (self.start + self.len).min(primary + (64 << 10)).saturating_sub(primary));
+        if lo >= hi {
+            return 0;
+        }
+        let (at, end) = (block + lo, block + hi);
+        {
+            let map = buffers_read();
+            for (_, e) in map.range(..(end, 0)).rev().take(256) {
+                // (The copy's own span: an entry's copy may lie elsewhere.)
+                if let Some(s) = e.shadow.as_ref().filter(|s| {
+                    let (from, n) = s.span();
+                    e.end > at && from < end && from + n > at && !std::ptr::eq(Arc::as_ptr(s), self)
+                }) {
+                    lazy_other(self, s);
+                    return 1;
+                }
+            }
+        }
+        {
+            let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+            for (key, s) in loose.range((at.saturating_sub(WINDOW), 0)..(end, 0)) {
+                if key.0 + key.1 > at && !std::ptr::eq(Arc::as_ptr(s), self) {
+                    lazy_other(self, s);
+                    return 1;
+                }
+            }
+        }
+        if crate::descriptor::host::next_start(at.saturating_sub(16 << 20), end).is_some() { 2 } else { 0 }
+    }
+
+    /// Of `crate::lazy`'s refusals: what a copy is (diagnostics).
+    fn lazy_other_said(&self) -> String {
+        format!(
+            "{:#x}+{:#x} card {} in place {} window {} written {}",
+            self.start,
+            self.len,
+            self.card.is_some(),
+            self.place.is_some(),
+            self.window,
+            self.written()
+        )
     }
 
     /// The CPU side's bytes at offsets `[from, to)` changed: they go to the
@@ -4240,6 +4339,7 @@ impl Shadow {
         if from >= to || self.place.is_some() {
             return;
         }
+        crate::lazy::resolve_shadow(self, from, to, crate::lazy::Why::Resend);
         let bytes = &bytes[self.start as usize + from - address..][..to - from];
         let _merging = self.merging.write().unwrap_or_else(|e| e.into_inner());
         if self.card.is_some() {
@@ -4568,8 +4668,35 @@ impl Shadow {
         let Some(card) = &self.card else {
             return 0;
         };
+        // (A deferred block is resolved before bytes go in beside it; not by
+        // the resolving itself.)
+        if crate::lazy::any() && !crate::lazy::resolving() {
+            for &(lo, hi, _) in pieces {
+                crate::lazy::resolve_shadow(self, lo, hi, crate::lazy::Why::Landing);
+            }
+        }
         let waiting = std::time::Instant::now();
-        let _merging = self.merging.read().unwrap_or_else(|e| e.into_inner());
+        // (A resolve of a deferred block, `crate::lazy`, runs on whichever
+        // thread faulted, which may hold this lock already, e.g. a refresh
+        // reading title memory: a second read behind a waiting writer would
+        // never end. Such a resolve asks without waiting for more than a few
+        // milliseconds and goes on without it, as a read of ours beside the
+        // lock's holder does.)
+        let _merging = if crate::lazy::resolving() {
+            loop {
+                match self.merging.try_read() {
+                    Ok(guard) => break Some(guard),
+                    Err(std::sync::TryLockError::Poisoned(e)) => break Some(e.into_inner()),
+                    Err(_) if waiting.elapsed().as_millis() >= 5 => {
+                        crate::lazy::lock_given_up();
+                        break None;
+                    }
+                    Err(_) => std::thread::yield_now(),
+                }
+            }
+        } else {
+            Some(self.merging.read().unwrap_or_else(|e| e.into_inner()))
+        };
         crate::land::spent(crate::land::stat::LOCK, waiting);
         let (from, to) = pieces.iter().fold((usize::MAX, 0), |(a, b), p| (a.min(p.0), b.max(p.1)));
         let skip: Vec<(usize, usize)> = {
@@ -4586,6 +4713,10 @@ impl Shadow {
             }
             let near: Vec<(usize, usize)> = skip.iter().copied().filter(|&(a, b)| a < hi && b > lo).collect();
             let parts: Vec<(usize, usize)> = outside(lo, hi, near).into_iter().map(|(a, b)| (a - lo, b - lo)).collect();
+            // (A count for `VICTORY_BACK_ON_CARD`: bytes of landed pieces
+            // that the title's own bytes in flight keep the card from
+            // changing.)
+            crate::lazy::skipped(hi - lo, (hi - lo).saturating_sub(parts.iter().map(|p| p.1 - p.0).sum::<usize>()));
             // SAFETY: inside the mapping (checked above), in a range
             // declared and not done with, which no refresh writes; the
             // title's bytes are kept out by the lock; the caller's.
@@ -4610,6 +4741,8 @@ impl Shadow {
         if self.card.is_some() || n == 0 || at + n > self.len as usize {
             return 0;
         }
+        // (A deferred block is resolved before bytes go in beside it.)
+        crate::lazy::resolve_shadow(self, at, at + n, crate::lazy::Why::Landing);
         let waiting = std::time::Instant::now();
         let _merging = self.merging.read().unwrap_or_else(|e| e.into_inner());
         crate::land::spent(crate::land::stat::LOCK, waiting);
@@ -4914,6 +5047,16 @@ fn buffers_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), 
 }
 
 /// A title buffer exists at `start` (`len` bytes).
+/// A refusal of `crate::lazy` for another copy over the block, said at the
+/// 1st, 2nd, 4th, ... time (diagnostics).
+fn lazy_other(me: &Shadow, other: &Shadow) {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n.is_power_of_two() && n <= 1 << 14 {
+        tracing::info!(n, "lazy copy-back refused: copy {} has another copy over it: {}", me.lazy_other_said(), other.lazy_other_said());
+    }
+}
+
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
     buffers().insert(
         (start, resource),

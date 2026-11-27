@@ -3867,6 +3867,8 @@ fn late_line(frames: f64) {
 pub(crate) mod aside;
 pub(crate) mod awake;
 mod card_steps;
+mod lazyfetch;
+pub(crate) use lazyfetch::{lazy_stash_free, lazy_stash_send, lazy_stash_slot, lazy_stash_wait};
 pub(crate) mod indirects;
 #[cfg(feature = "diagnostics")]
 mod panel;
@@ -4894,7 +4896,26 @@ impl Host {
                 })
                 .collect();
         }
+        // BACK ON READ (`crate::lazy`): what the title does not read is not
+        // fetched; its blocks are closed and fetched on the first access.
+        if !crate::lazy::active() {
+            crate::lazy::drain();
+        } else if land::on() {
+            crate::lazy::audit();
+            let flagged = total;
+            let behind = plans.iter().map(|p| p.0.sent_as).max().unwrap_or(0);
+            pieces = crate::lazy::split(pieces, behind);
+            total = 0;
+            for p in pieces.iter_mut() {
+                p.3 = total;
+                total += (p.2 - p.1) as u64;
+            }
+            crate::lazy::account(flagged, total);
+        }
         land::spent(land::stat::GATHER, gathering);
+        // (VICTORY_ACCESS_PROBE, a measuring aid: what is landed, and the
+        // probes of pages about to be written end.)
+        crate::accessprobe::landing(&pieces);
         if fetch.is_none() {
             *fetch = self.make_relay_fetch();
         }
@@ -4955,6 +4976,7 @@ impl Host {
             // (On the copy queue nothing was sent behind the fetch: `ahead` 0.)
             f.had.fetched(0, pieces.iter().map(|(shadow, lo, hi, _)| (shadow.id(), shadow.span().0 as usize + lo, hi - lo)));
             crate::shadow::relay_fetched(behind);
+            crate::accessprobe::landed(&pieces);
             return;
         }
         f.sent += 1;
@@ -5077,6 +5099,7 @@ impl Host {
         }
         // Sends up to `after` are of no use to any later merge.
         crate::shadow::relay_fetched(after);
+        crate::accessprobe::landed(&pieces);
     }
 
     /// [`Host::relay_card_back`]'s fetch on the copy queue, cut in `chunks`
@@ -5267,6 +5290,9 @@ impl Host {
                         hand_back.look(crate::land::stat::SCAN_BESIDE);
                     }
                 });
+                // BACK ON READ: the stash's fetches of deferred pieces are in
+                // before the title is told of these flights.
+                crate::lazy::fetched();
                 stage.next("landing: copies in the PC's memory");
                 hand_back.merge();
                 stage.next("landing: ranges done with");
@@ -8866,7 +8892,14 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
             read_pieces(at, to, remaining);
             break;
         }
-        if info.State != MEM_COMMIT || info.Protect == PAGE_NOACCESS {
+        if info.State == MEM_COMMIT && info.Protect == PAGE_NOACCESS && crate::lazy::any() {
+            // BACK ON READ: a deferred block is closed, not away: landed first,
+            // then read.
+            crate::lazy::resolve_range(at as usize, n, crate::lazy::Why::Another);
+            if !read(at, to, n) {
+                read_pieces(at, to, n);
+            }
+        } else if info.State != MEM_COMMIT || info.Protect == PAGE_NOACCESS {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
             // SAFETY: this path is only used with a writable host destination.
@@ -9261,6 +9294,7 @@ impl Meter {
         let gain = |i: usize| if now[i] >= self.prof_last[i] { now[i] - self.prof_last[i] } else { now[i] };
         let us = |i: usize| gain(i) * 1000;
         let draws = gain(0);
+        crate::lazy::world(draws > 300);
         let extra = |name, time, total| Extra { name, time, total, calls: 0 };
         let extras = [
             extra("frame.draws", false, draws),

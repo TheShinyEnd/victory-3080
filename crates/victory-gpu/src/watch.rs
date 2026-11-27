@@ -1946,6 +1946,13 @@ pub(crate) fn block_published(block: usize) -> bool {
     published(block * BLOCK, (block + 1) * BLOCK)
 }
 
+/// For the counters of `crate::lazy`: bit 0 the block is guarded (read-only
+/// by our hand), bit 1 its bit in [`PUBLISHED`], bit 2 the title's bytes put
+/// beside it ([`BESIDE`]).
+pub(crate) fn block_bits(block: usize) -> u8 {
+    u8::from(PROTECTED.any(block, block + 1)) | u8::from(PUBLISHED.all(block, block + 1)) << 1 | u8::from(BESIDE.any(block, block + 1)) << 2
+}
+
 /// Whether shaders' writes went into a page of `[at, at + len)` in the last
 /// `frames` frames.
 pub(crate) fn landed_lately(at: usize, len: usize, frames: u64) -> bool {
@@ -2172,6 +2179,13 @@ const BRIDGE: usize = 3;
 /// whether it was made and the protection that was there (of the first page).
 /// `alias`: for another view of a page the caller took.
 fn vprotect(at: usize, blocks: usize, prot: u32, alias: bool) -> (bool, u32) {
+    // BACK ON READ (`crate::lazy`): blocks whose bytes the card holds and
+    // title memory does not are closed; read-only is noted for later,
+    // read-write resolves them first.
+    crate::lazy::guard_call(at, blocks, prot, &|a, n| vprotect_real(a, n, prot, alias))
+}
+
+fn vprotect_real(at: usize, blocks: usize, prot: u32, alias: bool) -> (bool, u32) {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
     let mut old = 0;
     #[cfg(feature = "diagnostics")]
@@ -2560,6 +2574,8 @@ fn unguard_access(blocks: &[usize]) {
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
+    // BACK ON READ: bytes the card holds are landed before ours go in.
+    crate::lazy::resolve_range(at, len, crate::lazy::Why::Kernel);
     // The length is the title's (`fread`'s size times count, saturated).
     let last = at.saturating_add(len).div_ceil(BLOCK);
     if !light() || PROTECTED.any(at / BLOCK, last) {
@@ -2587,6 +2603,7 @@ pub struct KernelWrite(usize, usize);
 /// write fail (the kernel does not fault into our handler): a read cut
 /// short, which the title takes for what the file holds.
 pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
+    crate::lazy::resolve_range(at, len, crate::lazy::Why::Kernel);
     let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     {
         let mut g = guards_timed();
@@ -2677,6 +2694,9 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
     if len == 0 {
         return;
     }
+    // BACK ON READ: (written through our own views: no fault) the card's
+    // bytes of a deferred block are landed first.
+    crate::lazy::resolve_range(at, len, crate::lazy::Why::Kernel);
     let mode = page_writes();
     let end = at.saturating_add(len);
     if pages {
@@ -2713,6 +2733,13 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
 /// again - and are, the pages noted written, which also has the next check
 /// guard the new view ([`cover`]).
 pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
+    // BACK ON READ: a new view of pages whose bytes the card holds shows the
+    // old ones: the views we closed are resolved.
+    if crate::lazy::any() {
+        for (at, n) in crate::inplace::views_of_section(section, offset, len) {
+            crate::lazy::resolve_range(at, n, crate::lazy::Why::Mapping);
+        }
+    }
     if !view_guard() {
         return;
     }
@@ -2740,6 +2767,7 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
 /// ([`views_mapped`]). What is guarded of its pages at other views is opened,
 /// and not guarded again before the change is done ([`Remapping`]).
 pub fn title_memory_splitting(at: usize, len: usize) {
+    crate::lazy::resolve_range(at, len, crate::lazy::Why::Mapping);
     let others: Vec<usize> = elsewhere(at, len).into_iter().flat_map(|(_, others)| others).collect();
     if others.is_empty() {
         return;
@@ -3012,6 +3040,11 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 /// was noted of its blocks (guarded, clean, absent) would be taken for true
 /// of the next memory at the address.
 pub fn title_memory_freed(at: usize, len: usize) {
+    if len != 0 {
+        crate::lazy::resolve_range(at, len, crate::lazy::Why::Mapping);
+    } else if crate::lazy::any() {
+        crate::lazy::resolve_range(at, allocation_end(at, at).saturating_sub(at), crate::lazy::Why::Mapping);
+    }
     // Heaps opened over it (`VICTORY_UMA`) go before the memory does.
     crate::uma::freed(at, len);
     let mut g = guards();
@@ -3069,6 +3102,8 @@ fn allocation_end(at: usize, inside: usize) -> usize {
 fn title_memory_changed(at: usize, len: usize) -> std::sync::MutexGuard<'static, Guards> {
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
+    // BACK ON READ: before the views go or change, what the card holds is landed.
+    crate::lazy::resolve_range(at, len, crate::lazy::Why::Mapping);
     crate::descriptor::host::remapped(at, len);
     // The views the runtime told us of there are no longer what it shows.
     crate::inplace::views_gone(at, len);
@@ -3108,6 +3143,25 @@ pub(crate) fn install() {
         let r = unsafe { &*(*info).ExceptionRecord };
         const READ: usize = 0;
         const WRITE: usize = 1;
+        // BACK ON READ (`crate::lazy`, read faults): an access to a block that
+        // the card has newer bytes of (closed by us) fetches them first,
+        // whoever reads or writes; then it is tried again.
+        if r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION as NTSTATUS
+            && r.NumberParameters >= 2
+            && r.ExceptionInformation[0] <= 1
+            && crate::lazy::fault(r.ExceptionInformation[1], r.ExceptionInformation[0] == 1)
+        {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        // The access probe (`VICTORY_ACCESS_PROBE`): a probed page is given
+        // back and the access goes on.
+        if r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION as NTSTATUS
+            && r.NumberParameters >= 2
+            && r.ExceptionInformation[0] != 8
+            && crate::accessprobe::fault(r.ExceptionInformation[1], r.ExceptionInformation[0] == WRITE)
+        {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
         // A fault of our own copies (`crate::safecopy`): whatever it is, if
         // it is not a block we guard, the copy fails and goes on from there.
         let ours = crate::safecopy::failing_exit(r.ExceptionAddress as usize);

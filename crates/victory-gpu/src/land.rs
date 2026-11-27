@@ -181,6 +181,7 @@ pub(crate) fn log(frames: f64) {
         );
     }
     let s: Vec<f64> = STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    crate::lazy::log(frames);
     if s[stat::PIECES] == 0.0 && s[stat::REST] == 0.0 {
         return;
     }
@@ -594,6 +595,20 @@ fn taken() -> bool {
 static TAKEN: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 impl Notes {
+    /// For `crate::lazy`: a resolve put new bytes into the 4 KiB pages
+    /// `changed` (bits, not 0) of 64 KiB block `block`, through `copy`.
+    pub(crate) fn resolved(&mut self, block: usize, changed: u32, copy: *const crate::shadow::Shadow) {
+        let base = block * BLOCK;
+        let (first, last) = (changed.trailing_zeros() as usize, 31 - changed.leading_zeros() as usize);
+        for i in first..=last {
+            if changed >> i & 1 != 0 {
+                self.pages.push(base / PAGE + i);
+            }
+        }
+        self.spans.push((base + first * PAGE, (last + 1 - first) * PAGE));
+        self.landed.push((block, copy));
+    }
+
     /// At the end of a job: what it wrote beside the guards is noted.
     pub(crate) fn flush(&mut self) {
         if self.pages.is_empty() {
