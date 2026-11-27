@@ -958,13 +958,53 @@ fn fair_due() -> bool {
 pub(crate) struct TextureQueue {
     slots: std::collections::BTreeMap<u32, Waiting>,
     writes: u64,
+    /// Each slot write, requeue or new pass gets a later revision
+    /// (Vice-Tay 7eef143: bake coverage per heap).
+    revision: u64,
+    active_passes: usize,
+    /// The revision whose due slots a bake finished serving.
+    baked: Option<u64>,
     /// Slots held back because the card had no room for the host copy
     /// they need ([`TextureQueue::hold`]), each with the write it was
     /// held as.
     held: std::collections::BTreeMap<u32, u64>,
 }
 
+/// Only a pass that did not overlap another can certify a bake: ordinary
+/// passes can defer slots while the bake is reading its snapshot.
+pub(crate) struct TexturePass<'a> {
+    queue: &'a Mutex<TextureQueue>,
+    pub(crate) revision: Option<u64>,
+}
+
+impl<'a> TexturePass<'a> {
+    fn begin(queue: &'a Mutex<TextureQueue>) -> Self {
+        let mut textures = queue.lock().unwrap_or_else(|e| e.into_inner());
+        textures.revision += 1;
+        let revision = textures.revision;
+        textures.active_passes += 1;
+        Self { queue, revision: (textures.active_passes == 1).then_some(revision) }
+    }
+}
+
+impl Drop for TexturePass<'_> {
+    fn drop(&mut self) {
+        let mut textures = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        textures.active_passes = textures.active_passes.saturating_sub(1);
+    }
+}
+
 impl TextureQueue {
+    fn bake_covered(&self) -> bool {
+        self.baked == Some(self.revision)
+    }
+
+    fn finish_bake(&mut self, revision: u64) {
+        if self.revision == revision {
+            self.baked = Some(revision);
+        }
+    }
+
     /// A texture view was written into slot `index` in `frame`, due from
     /// frame `due`. `seen`: it was not written, a draw or the pass made
     /// the host slot from a view the queue may hold already, which then
@@ -974,6 +1014,7 @@ impl TextureQueue {
             return;
         }
         self.writes += 1;
+        self.revision += 1;
         let write = self.writes;
         self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
     }
@@ -1124,6 +1165,7 @@ impl TextureQueue {
     /// not take it out).
     fn changed(&mut self, index: u32, frame: u64, due: u64) {
         self.writes += 1;
+        self.revision += 1;
         let write = self.writes;
         let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
         self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
@@ -1850,6 +1892,25 @@ impl HostHeap {
         let writes = self.textures.lock().unwrap_or_else(|e| e.into_inner()).writes;
         let noted = |ranges: &Mutex<Vec<(u64, u64)>>| !ranges.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
         (writes, noted(&REMAPPED) || noted(&PAGE_WRITTEN) || noted(&BAKE_PAGE_WRITTEN))
+    }
+
+    /// A new pass invalidates earlier bake coverage before it gathers the due
+    /// slots (Vice-Tay 7eef143).
+    pub(crate) fn begin_texture_pass(&self) -> TexturePass<'_> {
+        TexturePass::begin(&self.textures)
+    }
+
+    /// The bake that began its pass at `revision` served all the due slots.
+    pub(crate) fn finish_bake(&self, revision: u64) {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).finish_bake(revision);
+    }
+
+    /// Whether a completed bake covered this heap and there are no pending
+    /// memory notes.
+    pub(crate) fn bake_covered(&self) -> bool {
+        let covered = self.textures.lock().unwrap_or_else(|e| e.into_inner()).bake_covered();
+        let noted = |ranges: &Mutex<Vec<(u64, u64)>>| !ranges.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
+        covered && !noted(&REMAPPED) && !noted(&PAGE_WRITTEN) && !noted(&BAKE_PAGE_WRITTEN)
     }
 
     /// Every title slot of the queue that is due at `frame`, and whether

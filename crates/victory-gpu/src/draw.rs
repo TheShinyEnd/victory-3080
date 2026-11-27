@@ -217,6 +217,29 @@ const BAKE_AHEAD: [u64; 2] = [12, 2];
 /// until something is new, the next bakes of the frame need no pass.
 static BAKE_SERVED: AtomicU64 = AtomicU64::new(0);
 
+/// `VICTORY_BAKE_PER_HEAP` (on by default; `0`: the global [`BAKE_SERVED`]
+/// as before). Bake coverage is kept per descriptor heap, by revision: only
+/// a texture pass that did not overlap another, and that served every slot
+/// due (a capped snapshot can leave due slots outside the pass), certifies
+/// a bake; any later write or pass makes the next bake run its own pass.
+/// From Vice-Tay 7eef143 (TaynanGT; GPL-3), after a race in which a later
+/// bake of the frame skipped its pass because an earlier one "served all"
+/// while an ordinary pass had deferred slots the bake then drew with.
+fn bake_per_heap() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BAKE_PER_HEAP").is_none_or(|v| v != "0"))
+}
+
+thread_local! {
+    /// The revision [`State::heap_textures`] certified for a bake on this
+    /// thread's last call (`None`: it certified nothing).
+    static BAKE_REVISION: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Bake passes since the start: run, left a slot out (served all: no),
+/// certified the heap, due slots outside a capped snapshot at the last one.
+static BAKE_SHORT: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
 /// Free-threaded wrapper around a reusable upload-only [`HostList`] protected
 /// by [`BAKE_UPLOAD`]. D3D12 command allocators, lists, and retained COM
 /// resources are free-threaded when externally synchronized.
@@ -2369,14 +2392,18 @@ impl State {
                 crate::texture::BAKING.set(exact);
                 self.flush_for_bake(bake_list, host, Some(&mut sync));
                 let left = bake_ms.saturating_sub(BAKED_MS.load(Ordering::Relaxed));
+                let per_heap = bake_per_heap();
                 let run_pass = left > 0
                     && (first
                         || !exact
-                        || {
+                        || if per_heap {
+                            !host.bake_covered()
+                        } else {
                             let (writes, noted) = host.texture_news();
                             noted || BAKE_SERVED.load(Ordering::Relaxed) != writes + 1
                         });
                 let mut served = false;
+                let mut covered = None;
                 if run_pass {
                     let n = EARLY_TEXTURE_PASSES[1].fetch_add(1, Ordering::Relaxed) + 1;
                     if n.is_power_of_two() {
@@ -2390,9 +2417,12 @@ impl State {
                             "a draw of the title's decoration bake: textures picked by index are uploaded synchronously first (VICTORY_BAKE_TEXTURES_MS=0: not)"
                         );
                     }
-                    BAKE_SERVED.store(0, Ordering::Relaxed);
+                    if !per_heap {
+                        BAKE_SERVED.store(0, Ordering::Relaxed);
+                    }
                     PASS_BUDGET.set(Some((left, 2 << 30, true)));
                     served = self.heap_textures(bake_list, heap, host, Some(&mut sync));
+                    covered = BAKE_REVISION.get();
                     PASS_BUDGET.set(None);
                 }
                 crate::texture::BAKING.set(false);
@@ -2409,7 +2439,11 @@ impl State {
                 host.texture_views_remade();
                 host.texture_slots_flip();
                 drop(sync.keep);
-                if run_pass && served && exact {
+                if per_heap {
+                    if let Some(revision) = covered {
+                        host.finish_bake(revision);
+                    }
+                } else if run_pass && served && exact {
                     BAKE_SERVED.store(host.texture_news().0 + 1, Ordering::Relaxed);
                 }
                 BAKED_MS.fetch_add(began.elapsed().as_millis() as u64, Ordering::Relaxed);
@@ -2423,16 +2457,26 @@ impl State {
             if left == 0 {
                 return;
             }
+            let per_heap = bake_per_heap();
             if !first && exact {
-                let (writes, noted) = host.texture_news();
-                if !noted && BAKE_SERVED.load(Ordering::Relaxed) == writes + 1 {
-                    return;
+                if per_heap {
+                    if host.bake_covered() {
+                        return;
+                    }
+                } else {
+                    let (writes, noted) = host.texture_news();
+                    if !noted && BAKE_SERVED.load(Ordering::Relaxed) == writes + 1 {
+                        return;
+                    }
                 }
             }
             EARLY_TEXTURE_PASSES[1].fetch_add(1, Ordering::Relaxed);
             PASS_BUDGET.set(Some((left, 2 << 30, true)));
             crate::texture::BAKING.set(exact);
             let _ = self.heap_textures(list, heap, host, None);
+            if per_heap && let Some(revision) = BAKE_REVISION.get() {
+                host.finish_bake(revision);
+            }
             crate::texture::BAKING.set(false);
             PASS_BUDGET.set(None);
             BAKED_MS.fetch_add(began.elapsed().as_millis() as u64, Ordering::Relaxed);
@@ -2546,6 +2590,7 @@ impl State {
         mut sync: Option<&mut BakeSync>,
     ) -> bool {
         let _p = victory_core::prof_scope!("draw.heap_textures");
+        BAKE_REVISION.set(None);
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
             return true;
@@ -2608,6 +2653,9 @@ impl State {
             once!("textures picked by index: the card has no room for more; they wait");
         }
         let mut refused = 0;
+        // A new pass invalidates earlier bake coverage before it gathers the
+        // due slots (bake_per_heap).
+        let pass = host.begin_texture_pass();
         // Room again: the slots held back while the card was full are due
         // now (`full_card_pass`).
         if room {
@@ -2636,11 +2684,14 @@ impl State {
         let (mut due, census) = host.texture_slots_due(frame, if baking { 1 << 16 } else { 4096 });
         // (Those that are due later after all that are due.)
         let on_time = due.len();
+        // A capped snapshot can leave due slots outside the pass.
+        let mut outside = (census[1] as usize).saturating_sub(on_time) as u64;
         if baking {
             let known: std::collections::HashSet<u32> = due.iter().map(|&(index, _)| index).collect();
             static AHEAD: AtomicU64 = AtomicU64::new(u64::MAX);
             let again = AHEAD.swap(frame, Ordering::Relaxed) == frame;
-            let (ahead, _) = host.texture_slots_due(frame + BAKE_AHEAD[usize::from(again)], 1 << 16);
+            let (ahead, ahead_census) = host.texture_slots_due(frame + BAKE_AHEAD[usize::from(again)], 1 << 16);
+            outside += ahead_census[1].saturating_sub(ahead.len() as u64);
             due.extend(ahead.into_iter().filter(|(index, _)| !known.contains(index)));
         }
         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
@@ -2724,10 +2775,10 @@ impl State {
         };
 
         let began = std::time::Instant::now();
-        if sync.is_none() {
+        if sync.is_none() && !bake_per_heap() {
             BAKE_SERVED.store(0, Ordering::Relaxed);
         }
-        let mut served = true;
+        let mut served = !(bake_per_heap() && outside > 0);
         // Lookups (no mip chain, small) and slots that already have their
         // host copy (the title rewrote them) are not deferred by the frame's
         // upload budget, within 96 MB a pass: a stale or late dither, colour
@@ -3165,7 +3216,33 @@ impl State {
                 None => host.texture_slot_done(index, write, again),
             }
         }
-        if sync.is_none() && baking && served {
+        if bake_per_heap() {
+            if baking {
+                // The shortfall of the bake's passes: how often a pass left
+                // slots out, and whether it could certify the heap.
+                BAKE_SHORT[0].fetch_add(1, Ordering::Relaxed);
+                BAKE_SHORT[1].fetch_add(u64::from(!served), Ordering::Relaxed);
+                BAKE_SHORT[3].store(outside, Ordering::Relaxed);
+                let certified = pass.revision.filter(|_| served);
+                BAKE_SHORT[2].fetch_add(u64::from(certified.is_some()), Ordering::Relaxed);
+                BAKE_REVISION.set(certified);
+                static NEXT: AtomicU64 = AtomicU64::new(0);
+                let now = crate::host::coarse_ms();
+                let next = NEXT.load(Ordering::Relaxed);
+                if now >= next && NEXT.compare_exchange(next, now + 5_000, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+                    let [passes, short, certified, outside] = BAKE_SHORT.each_ref().map(|c| c.load(Ordering::Relaxed));
+                    tracing::info!(
+                        frame,
+                        passes,
+                        left_slots_out = short,
+                        certified,
+                        outside_the_snapshot_at_the_last = outside,
+                        overlapped = passes - certified.min(passes) - short.min(passes),
+                        "decoration bake passes since the start (VICTORY_BAKE_PER_HEAP): how many left due slots out, how many certified the heap"
+                    );
+                }
+            }
+        } else if sync.is_none() && baking && served {
             BAKE_SERVED.store(host.texture_news().0 + 1, Ordering::Relaxed);
         }
         served
