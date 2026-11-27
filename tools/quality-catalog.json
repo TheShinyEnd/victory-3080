@@ -1039,7 +1039,7 @@
    ],
    "live": false,
    "needs_hooks": false,
-   "help": "A real GameInput mouse device the game polls itself (cursor motion inside the window, three buttons; vnvidia 12b1d16). The cursor is put back to the window's centre when it leaves the middle half, so a sweep does not stop at the edge.",
+   "help": "Only with the mouse mode `device` below: a real GameInput mouse device (cursor motion inside the window, three buttons; vnvidia 12b1d16). The cursor is put back to the window's centre when it leaves the middle half, so a sweep does not stop at the edge.",
    "cost": "None"
   },
   {
@@ -1048,20 +1048,20 @@
    "group": "Advanced / diagnostics",
    "kind": "choice",
    "words": [
-    "device",
-    "stick"
+    "stick",
+    "device"
    ],
    "min": 0,
    "max": 0,
    "presets": [
-    "device",
-    "device",
-    "device",
-    "device"
+    "stick",
+    "stick",
+    "stick",
+    "stick"
    ],
    "live": false,
    "needs_hooks": false,
-   "help": "device: the mouse is the GameInput mouse above. stick: the mouse look is the right stick of the keyboard's stand-in pad instead (ItsMK1's way; the game then has no mouse device).",
+   "help": "stick (default): the mouse look is the right stick of the keyboard's stand-in pad (ItsMK1's way; the cursor is hidden and held at the window's centre). device: the GameInput mouse device above instead; this title never reads it (counters in the log), so the camera does not follow.",
    "cost": "None"
   },
   {

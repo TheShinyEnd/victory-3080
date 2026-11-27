@@ -496,6 +496,7 @@ impl Hub {
         };
         let events = self.state().poll(&self.devices, self.one_pad, pads, keys, mouse);
         self.deliver(events);
+        stats_line();
     }
 
     /// Runs callbacks, never under our lock: they call back into us. One
@@ -632,6 +633,83 @@ fn host() -> Box<dyn Source> {
 
 static HUB: LazyLock<&'static Hub> = LazyLock::new(|| Hub::start(host()));
 
+/// Diagnostics: how the mouse (and the gamepad's right stick) travels from
+/// the host to the title, logged every ~5 s while anything moves
+/// (`stats_line`). Raw = cursor motion (or injected `VICTORY_MOUSE_TEST`
+/// deltas) the host source saw; accumulated = what the device state took;
+/// the calls are the title's.
+mod stat {
+    pub(super) const RAW_EVENTS: usize = 0;
+    pub(super) const RAW_SUM: usize = 1;
+    pub(super) const ACC_SUM: usize = 2;
+    pub(super) const REG_ALL: usize = 3;
+    pub(super) const REG_MOUSE: usize = 4;
+    pub(super) const CUR_ALL: usize = 5;
+    pub(super) const CUR_MOUSE: usize = 6;
+    pub(super) const CUR_MOUSE_HIT: usize = 7;
+    pub(super) const REL_MOUSE: usize = 8;
+    pub(super) const STATE_CALLS: usize = 9;
+    pub(super) const STATE_MOVED: usize = 10;
+    pub(super) const PAD_CALLS: usize = 11;
+    pub(super) const PAD_RS: usize = 12;
+    pub(super) const RECENTRED: usize = 13;
+    pub(super) const N: usize = 14;
+}
+static STATS: [AtomicU64; stat::N] = [const { AtomicU64::new(0) }; stat::N];
+/// (entry point, kind) -> calls: the kinds the title asks for.
+static KINDS_ASKED: Mutex<std::collections::BTreeMap<(&'static str, u32), u64>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+fn count(which: usize, n: u64) {
+    STATS[which].fetch_add(n, Ordering::Relaxed);
+}
+
+fn asked(entry: &'static str, kind: u32) {
+    *KINDS_ASKED.lock().unwrap_or_else(|e| e.into_inner()).entry((entry, kind)).or_insert(0) += 1;
+}
+
+/// The line, when something changed since the last one and 5 s passed.
+fn stats_line() {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    static LAST: Mutex<[u64; stat::N]> = Mutex::new([0; stat::N]);
+    let at = now();
+    let next = NEXT.load(Ordering::Relaxed);
+    if at < next || NEXT.compare_exchange(next, at + 5_000_000, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        return;
+    }
+    let s: [u64; stat::N] = std::array::from_fn(|i| STATS[i].load(Ordering::Relaxed));
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if *last == s {
+        return;
+    }
+    let d: Vec<u64> = s.iter().zip(last.iter()).map(|(a, b)| a - b).collect();
+    *last = s;
+    let kinds: Vec<String> = KINDS_ASKED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|((entry, kind), n)| format!("{entry}:{kind:#x}x{n}"))
+        .collect();
+    tracing::info!(
+        raw_events = d[stat::RAW_EVENTS],
+        raw_abs_sum = d[stat::RAW_SUM],
+        accumulated_abs_sum = d[stat::ACC_SUM],
+        recentred = d[stat::RECENTRED],
+        registrations = d[stat::REG_ALL],
+        registrations_for_mouse = d[stat::REG_MOUSE],
+        current_readings = d[stat::CUR_ALL],
+        current_readings_asking_mouse = d[stat::CUR_MOUSE],
+        of_those_answered = d[stat::CUR_MOUSE_HIT],
+        walks_asking_mouse = d[stat::REL_MOUSE],
+        get_mouse_state_calls = d[stat::STATE_CALLS],
+        mouse_state_moved_since_last_call = d[stat::STATE_MOVED],
+        get_gamepad_state_calls = d[stat::PAD_CALLS],
+        gamepad_right_stick_nonzero = d[stat::PAD_RS],
+        kinds_asked_since_start = %kinds.join(" "),
+        "mouse path (VICTORY_GAMEPAD_MOUSE / VICTORY_MNK_MOUSE): host to title, last 5 s"
+    );
+}
+
 type This = *const Object;
 type Out = *mut *const c_void;
 
@@ -693,6 +771,11 @@ extern "system" fn current_reading(
     out: Out,
 ) -> HRESULT {
     let hub = hub(this);
+    count(stat::CUR_ALL, 1);
+    asked("current", kind);
+    if kind & MOUSE_KIND != 0 {
+        count(stat::CUR_MOUSE, 1);
+    }
     let state = hub.state();
     let newest = |i: usize| {
         state.slots[i]
@@ -718,6 +801,9 @@ extern "system" fn current_reading(
         sequence = found.map(|r| r.sequence),
         "current reading"
     );
+    if kind & MOUSE_KIND != 0 && found.is_some_and(|r| r.kind() == MOUSE_KIND) {
+        count(stat::CUR_MOUSE_HIT, 1);
+    }
     hand(out, found)
 }
 
@@ -732,6 +818,10 @@ fn relative(
 ) -> HRESULT {
     if reference.is_null() {
         return fail(out, E_INVALIDARG);
+    }
+    asked(if forward { "next" } else { "previous" }, kind);
+    if kind & MOUSE_KIND != 0 {
+        count(stat::REL_MOUSE, 1);
     }
     let hub = hub(this);
     // SAFETY: a reading we handed out and the title still holds.
@@ -845,6 +935,11 @@ extern "system" fn register_device(
         return E_INVALIDARG;
     };
     let hub = hub(this);
+    count(stat::REG_ALL, 1);
+    if kind & MOUSE_KIND != 0 {
+        count(stat::REG_MOUSE, 1);
+    }
+    asked("register", kind);
     let registration = Registration {
         token: NEXT_TOKEN.fetch_add(1, Ordering::Relaxed),
         device: device as usize,
@@ -1129,6 +1224,10 @@ extern "system" fn key_state(this: *const Reading, count: u32, out: *mut KeyStat
 extern "system" fn gamepad_state(this: *const Reading, out: *mut PadState) -> bool {
     match &reading(this).value {
         Value::Pad(state) if !out.is_null() => {
+            count(stat::PAD_CALLS, 1);
+            if state.right_x != 0.0 || state.right_y != 0.0 {
+                count(stat::PAD_RS, 1);
+            }
             // SAFETY: checked non-null.
             unsafe { out.write(*state) };
             true
@@ -1139,6 +1238,13 @@ extern "system" fn gamepad_state(this: *const Reading, out: *mut PadState) -> bo
 extern "system" fn mouse_state(this: *const Reading, out: *mut MouseState) -> bool {
     match &reading(this).value {
         Value::Mouse(state) if !out.is_null() => {
+            static LAST_ASKED: Mutex<(i64, i64)> = Mutex::new((0, 0));
+            count(stat::STATE_CALLS, 1);
+            let mut last = LAST_ASKED.lock().unwrap_or_else(|e| e.into_inner());
+            if *last != (state.position_x, state.position_y) {
+                count(stat::STATE_MOVED, 1);
+                *last = (state.position_x, state.position_y);
+            }
             // SAFETY: the caller supplies room for the v0 state.
             unsafe { out.write(*state) };
             true
@@ -1329,6 +1435,19 @@ mod host {
             if !*ENABLED {
                 return None;
             }
+            // Synthetic input (VICTORY_MOUSE_TEST=dx,dy,period_ms): the device exists with
+            // no window in front, and takes the injected deltas where a cursor's would enter.
+            if let Some(test) = super::mnk::test_hook() {
+                let (dx, dy) = test.next(Instant::now()).map_or((0, 0), |d| (i64::from(d[0]), i64::from(d[1])));
+                if dx != 0 || dy != 0 {
+                    count(stat::RAW_EVENTS, 1);
+                    count(stat::RAW_SUM, (dx.abs() + dy.abs()) as u64);
+                    count(stat::ACC_SUM, (dx.abs() + dy.abs()) as u64);
+                }
+                self.mouse.position_x += dx;
+                self.mouse.position_y += dy;
+                return Some(self.mouse);
+            }
             let (mut point, mut rect) = (POINT::default(), RECT::default());
             let window = focused_window();
             let position = window.and_then(|window| {
@@ -1342,6 +1461,10 @@ mod host {
                 sampled.then_some((point.x, point.y))
             });
             let (mut cursor, (dx, dy)) = mouse_delta(self.previous_cursor, position, (rect.right, rect.bottom));
+            if dx != 0 || dy != 0 {
+                count(stat::RAW_EVENTS, 1);
+                count(stat::RAW_SUM, (dx.abs() + dy.abs()) as u64);
+            }
             if let (Some(window), Some((x, y)), true) = (window, cursor, *RECENTER) {
                 let (w, h) = (rect.right, rect.bottom);
                 if x < w / 4 || x > w - w / 4 || y < h / 4 || y > h - h / 4 {
@@ -1349,6 +1472,7 @@ mod host {
                     // SAFETY: a local point and the window the cursor was read for.
                     if unsafe { ClientToScreen(window, &mut centre) != 0 && SetCursorPos(centre.x, centre.y) != 0 } {
                         cursor = Some((w / 2, h / 2));
+                        count(stat::RECENTRED, 1);
                     }
                 }
             }
@@ -1357,6 +1481,7 @@ mod host {
                 self.mouse = MouseState::default();
                 return None;
             }
+            count(stat::ACC_SUM, (dx.abs() + dy.abs()) as u64);
             self.mouse.position_x += dx;
             self.mouse.position_y += dy;
             self.mouse.buttons = 0;

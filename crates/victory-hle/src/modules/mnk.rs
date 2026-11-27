@@ -9,10 +9,10 @@
 //! default only when no scripted keys are set (`VICTORY_MNK=1`/`0` forces).
 //!
 //! While the title's window is in front, the cursor is hidden and put back
-//! to the window's centre at every poll; its displacement is the look (only
-//! with `VICTORY_MNK_MOUSE=stick`; by default the mouse is a GameInput mouse
-//! device, see `gameinput.rs`, and this module maps the keys and the mouse
-//! buttons to pad buttons).
+//! to the window's centre at every poll; its displacement is the look (the
+//! default; `VICTORY_MNK_MOUSE=device` offers a GameInput mouse device
+//! instead, which this title never reads: see `gameinput.rs`'s counters). This
+//! module also maps the keys and the mouse buttons to pad buttons.
 
 use super::{
     A, B, DOWN, LEFT, LEFT_SHOULDER, LEFT_STICK, MENU, PadState, RIGHT, RIGHT_SHOULDER,
@@ -168,14 +168,16 @@ pub(crate) fn enabled() -> bool {
     config().is_some()
 }
 
-/// `VICTORY_MNK_MOUSE=stick`: the mouse look is the right stick of the
-/// stand-in pad (ItsMK1's way; the cursor is held at the window's centre) and
-/// there is no GameInput mouse device. Otherwise (the default) the mouse is
-/// a device the title polls itself (vnvidia 12b1d16, in `gameinput.rs`) and
-/// this module only maps keys.
+/// The mouse look is the right stick of the stand-in pad (ItsMK1/VIctory-MnK-patches:
+/// the cursor is held at the window's centre) and there is no GameInput mouse
+/// device. This is the default (`VICTORY_MNK_MOUSE=device` offers the device
+/// of vnvidia 12b1d16 instead): the title never asks GameInput for a mouse
+/// (no registration or reading of kind 0x20, no GetMouseState in 5 minutes of
+/// polling with the device present: the counters in `gameinput.rs`), only
+/// for the gamepad and the keyboard, so a device cannot turn the camera.
 pub(crate) fn stick_look() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_MNK_MOUSE").is_ok_and(|v| v.trim() == "stick"))
+    *ON.get_or_init(|| !std::env::var("VICTORY_MNK_MOUSE").is_ok_and(|v| v.trim() == "device"))
 }
 
 #[derive(Default)]
@@ -259,6 +261,40 @@ impl Mouse {
 
 /// The pad the mouse and keys make now; `None` when the profile is off.
 /// Nothing is pressed while another process's window is in front.
+/// `VICTORY_MOUSE_TEST=dx,dy,period_ms`: synthetic mouse motion, `dx,dy` every
+/// `period_ms` (at least 1), entering where a real cursor's displacement does
+/// (the device state in `gameinput.rs`, or this module's stick), and with no
+/// window in front. For live runs, where no mouse can be moved.
+pub(super) struct TestHook {
+    delta: [i32; 2],
+    period: Duration,
+    last: Mutex<Option<Instant>>,
+}
+
+impl TestHook {
+    /// The injected displacement if a period has passed since the last one.
+    pub(super) fn next(&self, now: Instant) -> Option<[i32; 2]> {
+        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        if last.is_none_or(|at| now.duration_since(at) >= self.period) {
+            *last = Some(now);
+            Some(self.delta)
+        } else {
+            None
+        }
+    }
+}
+
+fn parse_test(text: &str) -> Option<TestHook> {
+    let mut parts = text.split(',').map(|p| p.trim().parse::<i32>().ok());
+    let (dx, dy, period) = (parts.next()??, parts.next()??, parts.next()??);
+    Some(TestHook { delta: [dx, dy], period: Duration::from_millis(period.max(1) as u64), last: Mutex::new(None) })
+}
+
+pub(super) fn test_hook() -> Option<&'static TestHook> {
+    static HOOK: OnceLock<Option<TestHook>> = OnceLock::new();
+    HOOK.get_or_init(|| std::env::var("VICTORY_MOUSE_TEST").ok().and_then(|v| parse_test(&v))).as_ref()
+}
+
 pub(super) fn sample() -> Option<PadState> {
     let b = config()?;
     let mut m = mouse();
@@ -267,7 +303,7 @@ pub(super) fn sample() -> Option<PadState> {
     let mut pid = 0;
     // SAFETY: as above.
     unsafe { wm::GetWindowThreadProcessId(hwnd, &mut pid) };
-    if hwnd.is_null() || pid != std::process::id() {
+    if (hwnd.is_null() || pid != std::process::id()) && !(stick_look() && test_hook().is_some()) {
         *m = Mouse::default();
         return Some(PadState::default());
     }
@@ -281,7 +317,17 @@ pub(super) fn sample() -> Option<PadState> {
     let elapsed = m
         .last
         .map_or(Duration::from_millis(8), |last| now.duration_since(last));
-    if stick_look() && elapsed >= Duration::from_millis(8) {
+    if let (true, Some(hook)) = (stick_look(), test_hook()) {
+        if elapsed >= Duration::from_millis(8) {
+            let delta = hook.next(now).unwrap_or([0, 0]);
+            if delta != [0, 0] {
+                super::count(super::stat::RAW_EVENTS, 1);
+                super::count(super::stat::RAW_SUM, u64::from(delta[0].unsigned_abs() + delta[1].unsigned_abs()));
+            }
+            m.update_look(delta, now, elapsed, b.sensitivity);
+            m.last = Some(now);
+        }
+    } else if stick_look() && elapsed >= Duration::from_millis(8) {
         let displacement = recenter(hwnd);
         let delta = if m.centered {
             displacement.unwrap_or_default()
@@ -289,6 +335,10 @@ pub(super) fn sample() -> Option<PadState> {
             [0, 0]
         };
         m.centered = displacement.is_some();
+        if delta != [0, 0] {
+            super::count(super::stat::RAW_EVENTS, 1);
+            super::count(super::stat::RAW_SUM, u64::from(delta[0].unsigned_abs() + delta[1].unsigned_abs()));
+        }
         m.update_look(delta, now, elapsed, b.sensitivity);
         m.last = Some(now);
     }
@@ -332,6 +382,37 @@ mod tests {
         m.update_look([0, 0], start + dt * 12, dt, 0.135);
         assert!(m.stick[0] > 0.0);
         m.update_look([0, 0], start + dt * 17, dt, 0.135);
+        assert_eq!(m.stick, [0.0; 2]);
+    }
+
+    #[test]
+    fn test_hook_parses_and_paces() {
+        assert!(parse_test("x,1,2").is_none() && parse_test("1,2").is_none());
+        let h = parse_test("5,-3,16").unwrap();
+        let t = Instant::now();
+        assert_eq!(h.next(t), Some([5, -3]));
+        assert_eq!(h.next(t + Duration::from_millis(8)), None);
+        assert_eq!(h.next(t + Duration::from_millis(16)), Some([5, -3]));
+    }
+
+    /// What the title polls: a drag right and up (cursor y falls) gives a
+    /// right stick with x > 0 and y > 0 (up positive) at a moderate
+    /// sensitivity, and it falls to zero 40 ms after the last motion.
+    #[test]
+    fn mouse_motion_makes_a_right_stick_that_decays() {
+        let mut m = Mouse::default();
+        let start = Instant::now();
+        let dt = Duration::from_millis(8);
+        for i in 0..20 {
+            m.update_look([3, -3], start + dt * i, dt, 0.135);
+        }
+        assert!(m.stick[0] > 0.24 && m.stick[0] < 1.0 && m.stick[1] > 0.24, "{:?}", m.stick);
+        m.update_look([-3, 3], start + dt * 20, dt, 0.135);
+        for i in 21..30 {
+            m.update_look([-3, 3], start + dt * i, dt, 0.135);
+        }
+        assert!(m.stick[0] < 0.0 && m.stick[1] < 0.0, "{:?}", m.stick);
+        m.update_look([0, 0], start + dt * 36, dt, 0.135);
         assert_eq!(m.stick, [0.0; 2]);
     }
 
