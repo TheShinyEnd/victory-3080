@@ -3383,7 +3383,8 @@ impl Shadow {
                 return to;
             }
             let at = from + (to - from) / threads * i;
-            (at - (start + at) % PIECE).max(from)
+            // saturating: a first cut below a piece wrapped and that slice was never compared (fxceless 81d54b0).
+            at.saturating_sub((start + at) % PIECE).max(from)
         };
         let scan = &scan;
         std::thread::scope(|s| {

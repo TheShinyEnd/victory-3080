@@ -345,7 +345,7 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     if p.made.get().is_none() {
         let _p = victory_core::prof_scope!("pipe.request");
         start(p, REQUESTED);
-        if p.required_initialization {
+        if p.required_initialization || (p.graphics.is_none() && compute_wait()) {
             // OnceLock waits for a worker already compiling this pipeline, or
             // compiles it here: the shared frame budget (and the cap on waits for
             // new pipelines) cannot discard a one-time write.
@@ -355,6 +355,16 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         }
     }
     p.made.get()?.as_ref()
+}
+
+/// Whether a dispatch waits for its compute pipeline until it is made
+/// (`VICTORY_PIPELINE_COMPUTE_WAIT=0`: within the frame's budget, as before).
+/// A dropped draw is drawn again in the next frame; a dropped one-time
+/// dispatch is not, and what it should have written stays wrong (adapted
+/// from fxceless/victory-fork a42b627, GPL-3).
+fn compute_wait() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_COMPUTE_WAIT").is_none_or(|v| v != "0"))
 }
 
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
