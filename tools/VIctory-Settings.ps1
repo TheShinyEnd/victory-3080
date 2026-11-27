@@ -8,8 +8,8 @@
 # quality-catalog.json next to this script (tools\gen-quality-catalog.py makes it from the source).
 param(
     [string]$File = (Join-Path $env:LOCALAPPDATA 'victory\quality.toml'),
-    [string]$Exe = 'C:\Users\thesh\Downloads\Leonida-v7\target\diag\victory.exe',
-    [string]$Play = 'C:\Users\thesh\Downloads\Leonida-local\Play-Fork.ps1',
+    [string]$Exe = (Join-Path $PSScriptRoot '..\target\release\victory.exe'),
+    [string]$Play = (Join-Path $PSScriptRoot '..\Play-VIctory.cmd'),
     [string]$Fork = 'v7',
     [switch]$SelfTest
 )

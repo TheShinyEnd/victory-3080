@@ -85,7 +85,7 @@ pub fn mount_at(letter: char, root: &Path) {
 /// `root` as UTF-16, absolute, without trailing separators (a drive root
 /// keeps its own). An empty root is the current directory, as it is to a
 /// path joined to it: it is the title's folder when the title is run by its
-/// file name alone (`victory run GTA6.exe`).
+/// file name alone (`victory run game.exe`).
 fn root_wide(root: &Path) -> Vec<u16> {
     let root = if root.as_os_str().is_empty() {
         Path::new(".")
@@ -184,7 +184,7 @@ pub(crate) fn translate(path: &[u16]) -> Option<Vec<u16>> {
 }
 
 /// A title's wide path: the host path when it is on a virtual drive, else
-/// the title's own pointer.
+/// The title's own pointer.
 struct Wide(*const u16, Option<Vec<u16>>);
 
 impl Wide {

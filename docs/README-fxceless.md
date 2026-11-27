@@ -30,7 +30,6 @@ developer or publisher.
   VIctory #1122 by tightfall. The read-beside fix for kernel reads into title
   memory is by **Joshua Odom** (commit `10ea38e` of the same fork family). Both
   are carried here unchanged apart from one merge conflict.
-- This fork's changes were developed with [Claude Code](https://claude.com/claude-code).
 
 ## Status of this fork (2026-11-25)
 

@@ -1010,7 +1010,7 @@ fn run_tables(shader: &HostShader, views: &[View], strides: Vec<u32>) -> Vec<(&'
 /// 16-bit typed stores and loads (`_d16`) through views of integer formats
 /// pass the bits (the console's buffer format decides the conversion; d16
 /// only packs 16-bit results), and through float views convert as halves:
-/// Grand Theft Auto VI's face network keeps its halves in UINT views.
+/// The title's face network keeps its halves in UINT views.
 #[test]
 fn d16_typed_buffer_accesses_pass_bits_through_integer_views() {
     let shader = build(
