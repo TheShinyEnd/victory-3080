@@ -157,14 +157,14 @@ fn shade() -> [f32; 2] {
     })
 }
 
-/// `VICTORY_AMBIENT_MAGENTA` (on by default; `0`/`off`: as before): drop magenta left in the probes memory
+/// `VICTORY_AMBIENT_MAGENTA=1` (off by default, the user's choice: no stand-in for the missing rays): drop magenta left in the probes memory
 /// (green below half of the smaller of red and blue) before it is kept as
 /// light in `raise`. From Vice-Tay 1bf62e1 / Belobug 81ebb7bd.
 fn magenta() -> bool {
     static SET: OnceLock<bool> = OnceLock::new();
     *SET.get_or_init(|| {
         let set = std::env::var("VICTORY_AMBIENT_MAGENTA").unwrap_or_default();
-        !matches!(set.trim(), "0" | "off" | "false")
+        matches!(set.trim(), "1" | "on" | "true")
     })
 }
 
