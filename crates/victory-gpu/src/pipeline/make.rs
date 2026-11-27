@@ -345,7 +345,11 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     if p.made.get().is_none() {
         let _p = victory_core::prof_scope!("pipe.request");
         start(p, REQUESTED);
-        if p.required_initialization || (p.graphics.is_none() && compute_wait()) {
+        if p.graphics.is_none() && !p.required_initialization {
+            compute_wait(p);
+        }
+        if p.made.get().is_some() {
+        } else if p.required_initialization {
             // OnceLock waits for a worker already compiling this pipeline, or
             // compiles it here: the shared frame budget (and the cap on waits for
             // new pipelines) cannot discard a one-time write.
@@ -357,14 +361,42 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     p.made.get()?.as_ref()
 }
 
-/// Whether a dispatch waits for its compute pipeline until it is made
-/// (`VICTORY_PIPELINE_COMPUTE_WAIT=0`: within the frame's budget, as before).
-/// A dropped draw is drawn again in the next frame; a dropped one-time
-/// dispatch is not, and what it should have written stays wrong (adapted
-/// from fxceless/victory-fork a42b627, GPL-3).
-fn compute_wait() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_COMPUTE_WAIT").is_none_or(|v| v != "0"))
+/// A dispatch waits for its compute pipeline, made by the workers, up to
+/// `VICTORY_PIPELINE_COMPUTE_WAIT_MS` (default 1000; 0: only within the
+/// frame's budget, as before). A dropped draw is drawn again in the next
+/// frame; a dropped one-time dispatch is not, and what it should have
+/// written stays wrong (after fxceless/victory-fork a42b627, GPL-3). Bounded,
+/// and not compiled on the asking thread: with cold caches an unbounded wait
+/// on the title's list threads ended in the title's own crash handler.
+fn compute_wait(p: &Pending) {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let ms = *MS.get_or_init(|| {
+        std::env::var("VICTORY_PIPELINE_COMPUTE_WAIT_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1000)
+    });
+    if ms == 0 {
+        return;
+    }
+    // Once per pipeline: one that is never made (or takes minutes) must not
+    // cost every later dispatch the whole wait.
+    let cap = Duration::from_millis(ms).saturating_sub(Duration::from_micros(p.waited_us.load(Ordering::Relaxed)));
+    if cap.is_zero() {
+        return;
+    }
+    let _p = victory_core::prof_scope!("pipe.wait.compute");
+    let started = Instant::now();
+    let (lock, done) = &DONE;
+    let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    while p.made.get().is_none() {
+        let rest = cap.saturating_sub(started.elapsed());
+        if rest.is_zero() {
+            break;
+        }
+        held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
+    }
+    drop(held);
+    if p.made.get().is_none() {
+        p.waited_us.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
 }
 
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
