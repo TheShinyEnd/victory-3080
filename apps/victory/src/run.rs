@@ -177,6 +177,60 @@ pub fn run(
         // SAFETY: the image stays mapped and nothing of it has run yet.
         unsafe { victory_loader::watchdog::disarm(image.base(), size) };
     }
+    // The frame rate: `VICTORY_FPS=<n>|max|unlimited` (30 or unset: nothing is
+    // done and nothing changes). `VICTORY_FRAME_INTERVAL_MS` (our clock only,
+    // for tests) and `VICTORY_TITLE_FPS=<n>|off` (the rate the title is given)
+    // still work on their own. Three reads of the title's frame rate setting
+    // (image offsets 0x1e0fc62, 0x224359a, 0x2241fdb of 1.0.2.1) are patched,
+    // all or none, after a byte check; our frame clock ticks at the interval.
+    #[cfg(windows)]
+    if execute {
+        use victory_loader::frame_rate::{Fps, Patched, SITES, apply, asked_interval_ms, parse_fps, plan, title_interval_us, title_rate};
+        let spec = std::env::var("VICTORY_FPS").unwrap_or_default();
+        let fps = parse_fps(&spec).unwrap_or_else(|| {
+            println!("frame rate: VICTORY_FPS={spec}: expected 30, a number up to 1000, max or unlimited; the title's own 30 is kept");
+            Fps::Thirty
+        });
+        let refresh = victory_hle::hdr::chosen().map_or(0, |m| m.refresh);
+        let (rate, interval_us, why) = match plan(fps, refresh) {
+            Some((rate, us)) => (Some(rate), Some(us), format!("VICTORY_FPS={}", spec.trim())),
+            None => match asked_interval_ms() {
+                Some(ms) => (
+                    title_rate(ms, std::env::var("VICTORY_TITLE_FPS").ok().as_deref()),
+                    Some((ms * 1000.0).round() as u64),
+                    "VICTORY_FRAME_INTERVAL_MS".to_string(),
+                ),
+                None => (None, None, String::new()),
+            },
+        };
+        if let Some(us) = interval_us {
+            if spec.trim().is_empty() || parse_fps(&spec).is_some_and(|f| f != Fps::Thirty) {
+                victory_hle::ask_frame_interval(std::time::Duration::from_micros(us));
+            }
+        }
+        match (rate, interval_us) {
+            (Some(rate), Some(us)) => {
+                let size = image.info().size_of_image as usize;
+                // SAFETY: the image stays mapped and nothing of it has run yet.
+                let done = unsafe { apply(image.base(), size, rate, &SITES) };
+                let patched = done.iter().filter(|d| **d == Patched::Done).count();
+                if patched == SITES.len() {
+                    println!(
+                        "frame rate: the title is given {} (3 reads of its setting patched, {why}); our clock ticks every {us} us{}; it asks for {} us at 60 Hz",
+                        if rate == 0 { "no limit".to_string() } else { format!("{rate} frames a second") },
+                        if fps == Fps::Max { format!(" (the display's {refresh} Hz)") } else { String::new() },
+                        title_interval_us(rate, false),
+                    );
+                } else {
+                    println!(
+                        "frame rate: NOT patched ({why}): the title's bytes at its frame rate setting are not those of 1.0.2.1, nothing was written; the title keeps its own rate"
+                    );
+                }
+            }
+            (None, Some(us)) => println!("frame rate: our clock ticks every {us} us; the title's own rate (30) left as it is"),
+            _ => {}
+        }
+    }
     if !execute {
         println!("not executing (pass --execute to start the title)");
         return Ok(());
@@ -214,6 +268,7 @@ fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) 
     victory_loader::profile_on_schedule(victory_hle::frame_phase);
     victory_hle::modules::audio::capture::start();
     watch(image.base(), image.info().size_of_image as usize);
+    timers(image.base(), image.info().size_of_image as usize);
     poke(image.base(), image.info().size_of_image as usize);
     // Debugging aid: `VICTORY_CRASH_SAVE=<rva>:<len>,...` (hex) writes those
     // title ranges to `crash-<rva>.bin` in the cache dir on a crash.
@@ -258,6 +313,46 @@ fn watch(base: usize, size: usize) {
                 }
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    });
+}
+
+/// Debugging aid: `VICTORY_TIMER_LOG=1` logs the title's timers once a
+/// second (`victory_loader::frame_rate`): its frame time and limiter flag,
+/// and each timer's two times, step in seconds and in milliseconds. Whether
+/// game time keeps to the wall clock at any frame rate is read from these.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn timers(base: usize, size: usize) {
+    use victory_loader::frame_rate::{FRAME_US, LIMITER_ON, TIMERS};
+    if std::env::var("VICTORY_TIMER_LOG").ok().as_deref() != Some("1") {
+        return;
+    }
+    if TIMERS.iter().chain([&FRAME_US, &LIMITER_ON]).any(|&rva| rva + 0x14 > size) {
+        return;
+    }
+    std::thread::spawn(move || {
+        let start = std::time::Instant::now();
+        let u32_at = |rva: usize| {
+            // SAFETY: inside the mapped image (checked above), title data.
+            unsafe { ((base + rva) as *const u32).read_volatile() }
+        };
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            let timers: Vec<String> = TIMERS
+                .iter()
+                .map(|&t| {
+                    let step = f32::from_bits(u32_at(t + 0xc));
+                    format!("{} {} {step:.4} {}", u32_at(t), u32_at(t + 4), u32_at(t + 0x10))
+                })
+                .collect();
+            eprintln!(
+                "VIctory: the title's timers at {} ms: frame_us {} limiter {} frames {}; timers (time ms, frames, step s, step ms): {}",
+                start.elapsed().as_millis(),
+                u32_at(FRAME_US),
+                u32_at(LIMITER_ON) & 0xff,
+                victory_hle::frames_begun(),
+                timers.join(" | ")
+            );
         }
     });
 }

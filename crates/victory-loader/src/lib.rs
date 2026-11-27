@@ -39,6 +39,7 @@ mod thunks;
 mod tls;
 #[cfg(windows)]
 pub mod write_sites;
+pub mod frame_rate;
 pub mod watchdog;
 #[cfg(windows)]
 mod windows;

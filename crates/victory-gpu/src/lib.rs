@@ -122,6 +122,16 @@ pub fn switched(switch: &str) -> Option<bool> {
 pub fn frame_phase() -> u32 {
     copystat::phase()
 }
+/// Frames the title has begun (its frame waits that ended), for logs.
+pub fn frames_begun() -> u64 {
+    frame::current()
+}
+
+/// Our frame clock's interval for the run (`VICTORY_FPS`); zero: no wait.
+pub fn ask_frame_interval(interval: std::time::Duration) {
+    frame::ask_interval(interval);
+}
+
 #[cfg(windows)]
 pub use uma::title_allocation;
 #[cfg(windows)]

@@ -15,6 +15,9 @@ mod host;
 mod image_watch;
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use victory_gpu::frame_phase;
+pub use victory_gpu::{ask_frame_interval, frames_begun};
+#[cfg(windows)]
+pub use victory_gpu::hdr;
 
 pub mod modules;
 mod registry;
