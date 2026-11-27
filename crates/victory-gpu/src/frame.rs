@@ -163,6 +163,23 @@ pub(crate) extern "system" fn wait(
         add(C::PaceWaits, 1);
         add(C::PaceUs, wait.min(limit).as_micros() as u64);
     }
+    // `VICTORY_FRAME_SLEEP_MS=n` (an experiment, default 0): every frame the
+    // title begins is held n milliseconds more, to tell whether the title
+    // streams its world by frames or by seconds (stream2).
+    if origin && hr == S_OK {
+        static EXTRA: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let extra = *EXTRA.get_or_init(|| {
+            std::env::var("VICTORY_FRAME_SLEEP_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+        });
+        // `VICTORY_FRAME_SLEEP_AFTER=n`: only from frame n on (the load before the world runs at full pace).
+        static AFTER: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let after = *AFTER.get_or_init(|| {
+            std::env::var("VICTORY_FRAME_SLEEP_AFTER").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+        });
+        if extra > 0 && current() >= after {
+            std::thread::sleep(Duration::from_millis(extra));
+        }
+    }
     // A frame begun on a time-out takes no tick: its flip still does.
     if origin && (hr == S_OK || flags & TOKEN_ON_TIMEOUT != 0) {
         // Tokens count frames (consecutive), not ticks.

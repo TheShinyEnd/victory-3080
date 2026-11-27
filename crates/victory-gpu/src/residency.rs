@@ -510,6 +510,23 @@ pub(crate) fn note_refused(shape: Shape, why: Why) {
     }
 }
 
+/// The slots left without a host copy for the budget and not made resident since,
+/// with their bytes (for the audit of `crate::arrival`).
+pub(crate) fn null_slots() -> Vec<(u32, u64)> {
+    NULLS.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|(&slot, s)| (slot, s.bytes)).collect()
+}
+
+/// How many slots are null for the budget now and their bytes.
+pub(crate) fn null_bytes() -> (usize, u64) {
+    let n = NULLS.lock().unwrap_or_else(|e| e.into_inner());
+    (n.len(), n.values().map(|s| s.bytes).sum())
+}
+
+/// Forgets slot `slot` as null (the audit found it shows something, or nothing of ours).
+pub(crate) fn forget_null(slot: u32) {
+    NULLS.lock().unwrap_or_else(|e| e.into_inner()).remove(&slot);
+}
+
 /// Slot `slot` has its host copy now.
 pub(crate) fn note_resident(slot: u32) {
     let mut nulls = NULLS.lock().unwrap_or_else(|e| e.into_inner());
@@ -596,6 +613,28 @@ pub(crate) fn report(memory: Option<[u64; 4]>) {
         d[3],
         EVICTING.load(Ordering::Relaxed),
     );
+    {
+        // Why `room` says no with memory free (stream2): the use as the
+        // admission counts it against its line, and what makes the difference.
+        let p = crate::resource::room_parts(memory).map(|b| b >> 20);
+        let largest = nulls.values().map(|s| s.bytes).max().unwrap_or(0);
+        let smallest = nulls.values().map(|s| s.bytes).min().unwrap_or(0);
+        tracing::info!(
+            "residency room: card used {} of budget {} MB, free {} MB; counted {} MB against the room line {} MB (counted = used - pool free {} + kept for buffers {} + kept for targets {});              room now {}; null textures {} (smallest {} KB, largest {} KB)",
+            p[1],
+            p[0],
+            p[0].saturating_sub(p[1]),
+            p[6],
+            p[5],
+            p[2],
+            p[3],
+            p[4],
+            p[6] < p[5],
+            null_n,
+            smallest >> 10,
+            largest >> 10,
+        );
+    }
     let n = trace_limit();
     if n > 0 && !nulls.is_empty() {
         let mut all: Vec<&Shape> = nulls.values().collect();

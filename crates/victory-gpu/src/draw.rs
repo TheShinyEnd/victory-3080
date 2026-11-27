@@ -2639,6 +2639,7 @@ impl State {
         let mut room = crate::resource::room(memory);
         // The residency probe line (`VICTORY_RESIDENCY_TRACE`, `_FIRST`).
         crate::residency::report(memory);
+        crate::arrival::null_audit(heap, host, frame, memory);
         // Bytes this pass uploaded: what the card's use, as asked at its
         // start, does not show yet (for the small textures let in past the
         // line).
@@ -2650,6 +2651,7 @@ impl State {
         let mut since_asked = 0u64;
         if !room {
             HEAP_TEXTURES_FULL.fetch_add(1, Ordering::Relaxed);
+            crate::arrival::note_full();
             once!("textures picked by index: the card has no room for more; they wait");
         }
         let mut refused = 0;
@@ -2751,6 +2753,16 @@ impl State {
         let catchup = *CATCHUP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
         let more = if !crate::residency::part(crate::residency::Part::Uploads) { 3 } else { 2 };
         let (per_frame, span) = if catchup && on_time >= 1024 { (per_frame * more, span * more as u32) } else { (per_frame, span) };
+        // `VICTORY_UPLOAD_PER_SECOND=1` (stream2): the bytes a pass may upload count per
+        // second, not per frame: a frame that took 40 ms or more since the last pass
+        // gets that many times 33 ms of them (4 at most), so at 7 frames a second the
+        // queue drains as fast as at 30 (the pass's time limit stands).
+        static PER_SECOND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let per_frame = if *PER_SECOND.get_or_init(|| std::env::var_os("VICTORY_UPLOAD_PER_SECOND").is_some_and(|v| v == "1")) {
+            per_frame.saturating_mul((took / 40).clamp(1, 4))
+        } else {
+            per_frame
+        };
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
         // (Not `most`: that is the longest wait between looks, used below.)

@@ -24,6 +24,10 @@ mod compose;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
+#[cfg(windows)]
+mod arrival;
+#[cfg(windows)]
+mod threadstat;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod faultbook;
 #[cfg(windows)]

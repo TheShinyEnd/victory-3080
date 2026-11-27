@@ -2156,6 +2156,27 @@ impl HostHeap {
         self.made.get(index) == Some(key) && self.kept_in(index).is_some()
     }
 
+    /// Whether host slot `index` shows a view now (the arrival audit).
+    pub(crate) fn texture_slot_shown(&self, index: u32) -> bool {
+        index < self.count && self.made.get(index).is_some_and(|key| key != 0)
+    }
+
+    /// Whether title slot `index` waits in the queue of textures picked by index.
+    pub(crate) fn texture_slot_queued(&self, index: u32) -> bool {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).slots.contains_key(&index)
+    }
+
+    /// Makes slot `index` due from the next frame, unless it waits in the queue
+    /// already (a slot the pass refused for the budget and then dropped).
+    pub(crate) fn texture_slot_due_now(&self, index: u32, frame: u64) -> bool {
+        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        if textures.slots.contains_key(&index) {
+            return false;
+        }
+        textures.changed(index, frame, frame + 1);
+        true
+    }
+
     /// Levels on demand (`crate::tiles`): makes again the host slots of the
     /// placed textures whose first level with memory changed since the
     /// last call ([`levels_changed`]), each from the view it was made

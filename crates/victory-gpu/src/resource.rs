@@ -1774,6 +1774,25 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     }
 }
 
+/// For the room line (`crate::residency::report`): the card's budget and
+/// use as the system says, the free blocks of our texture pool, what is
+/// kept for card copies of buffers not made and for render targets not made,
+/// the line `room` tests against (the share of the budget), and the use
+/// as `room` counts it.
+#[cfg(windows)]
+pub(crate) fn room_parts(memory: Option<[u64; 4]>) -> [u64; 7] {
+    let Some([budget, used, ..]) = memory else { return [0; 7] };
+    [
+        budget,
+        used,
+        crate::pool::texture_room(),
+        crate::shadow::card_room_kept(),
+        targets_room_kept(),
+        budget / 100 * room_percent(),
+        counted_use(used),
+    ]
+}
+
 /// The card's memory in use as the texture admission counts it: what the
 /// system says, less the free blocks of our texture pool, plus what is kept
 /// for card copies of buffers and for render targets not made yet.
@@ -2367,6 +2386,19 @@ pub(crate) fn let_go_idle() {
             crate::host::vram_keep(budget, used)
         }
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
+    };
+    // Demand-driven (stream2, `VICTORY_DEMAND_EVICT=0` off): while textures wait for
+    // room (the pass found none in the last two seconds), copies idle for a second and
+    // four frames go at once, the longest idle first, as many bytes as wait
+    // (and a margin), whatever the card's tier says: the queue drives the
+    // sweep, the tiers are the backstop. Only copies no slot or list holds go
+    // (as always), so nothing a frame samples is touched.
+    let (idle_ms, most) = match crate::arrival::demand_bytes() {
+        0 => (idle_ms, most),
+        wanted => {
+            let take = wanted + (64 << 20);
+            (idle_ms.min(1_000), if most == u64::MAX { take } else { most.max(take) })
+        }
     };
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
